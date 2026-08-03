@@ -18,6 +18,7 @@ namespace AsyncSave.Config
         // 2 - World Save (server side; a client never runs the world save at all)
         public static ConfigEntry<bool> WorldSaveEnabled;
         public static ConfigEntry<int> SliceBudgetMs;
+        public static ConfigEntry<bool> AdaptiveBudget;
         public static ConfigEntry<int> MaxZdosPerSlice;
         public static ConfigEntry<bool> DeltaReconciliation;
 
@@ -53,11 +54,24 @@ namespace AsyncSave.Config
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,
-                "Wall-clock time budget per snapshot slice on the main thread. Lower = smoother frames, longer total snapshot time.");
+                "Upper bound on the main-thread time budget per snapshot slice. Lower = smoother " +
+                "frames, longer total snapshot time. With the adaptive budget on this is a ceiling, " +
+                "not a target - a slice only ever gets whatever the frame had left over.");
+
+            AdaptiveBudget = cfg.Bind(
+                "2 - World Save", "Adaptive budget", true,
+                "Scale each slice to the frame time the game is not already using, instead of " +
+                "spending the full slice budget unconditionally. On frames that have already " +
+                "missed the target framerate the snapshot does almost nothing, so a save costs " +
+                "little when the game is struggling - at the price of a longer save window. " +
+                "Turn off for a fixed budget and the shortest possible save.");
 
             MaxZdosPerSlice = cfg.Bind(
-                "2 - World Save", "Max ZDOs per slice", 5000,
-                "Hard cap on ZDOs serialized per slice, regardless of time budget. Bounds worst-case slice duration when serialization is unusually fast.");
+                "2 - World Save", "Max ZDOs per slice", 50000,
+                "Safety valve: hard cap on ZDOs examined per slice, regardless of the time budget. " +
+                "Only meant to bound a slice if the clock misbehaves. Setting this low enough to " +
+                "trip before the time budget (a ZDO costs a few hundred nanoseconds) just wastes " +
+                "budget and stretches the save out.");
 
             DeltaReconciliation = cfg.Bind(
                 "2 - World Save", "Reconcile mutations", true,

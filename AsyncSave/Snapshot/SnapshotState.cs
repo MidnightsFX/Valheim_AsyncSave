@@ -8,14 +8,21 @@ namespace AsyncSave.Snapshot
     {
         // Pooled - allocated once, grown as needed, cleared (not freed) each save.
         public static readonly SnapshotBuffer Buffer = new SnapshotBuffer(4 * 1024 * 1024);
-        public static readonly List<SnapshotEntry> Entries = new List<SnapshotEntry>(65536);
+
+        // A plain array rather than a List: List.Clear() memsets its backing store, and on a
+        // five-million-ZDO world that is ~100 MB of stores on the trigger frame for a struct
+        // that holds no references. Resetting is EntryCount = 0; nothing past the count is
+        // ever read. Grown by GrowEntries, never shrunk - same policy as SnapshotBuffer.
+        public static SnapshotEntry[] Entries = new SnapshotEntry[65536];
+        public static int EntryCount;
+
         public static readonly List<ZDOID> PendingAdds = new List<ZDOID>(1024);
         public static readonly HashSet<ZDOID> PendingRemoves = new HashSet<ZDOID>(ZdoIdComparer.Instance);
         // Dedup set for the walk. A ZDO that migrates sectors during a yield can appear in
         // both the old sector's scratch (already processed) and the new one's; Add returns
-        // false on the second sighting. HashSet.Add tests and inserts in a single probe,
-        // which is why this is not a Dictionary - nothing ever needed the index value.
-        public static readonly HashSet<ZDOID> Visited = new HashSet<ZDOID>(ZdoIdComparer.Instance);
+        // false on the second sighting. Add tests and inserts in a single probe, which is why
+        // this is not a Dictionary - nothing ever needed the index value.
+        public static readonly VisitedSet Visited = new VisitedSet(65536);
         // Per-sector scratch reused across sectors: refs to persistent ZDOs, snapshotted
         // atomically at sector start so mid-sector yields cannot desync from live mutations.
         public static readonly List<ZDO> SectorScratch = new List<ZDO>(4096);
@@ -56,12 +63,41 @@ namespace AsyncSave.Snapshot
             ReadyForWrite = false;
             ZoneSnapshot.Reset();
 
+            // Everything below is O(1) or bounded by the number of mid-snapshot mutations.
+            // It runs synchronously on the frame that triggers the save, so nothing here may
+            // be proportional to world size.
             Buffer.Reset();
-            Entries.Clear();
+            EntryCount = 0;
             PendingAdds.Clear();
             PendingRemoves.Clear();
             Visited.Clear();
             SectorScratch.Clear();
+        }
+
+        /// Size the entry array for an expected ZDO count. Only valid while EntryCount is 0:
+        /// it discards the old array rather than copying, so the first save on a large world
+        /// pays one allocation instead of a doubling chain whose last step copies a hundred
+        /// megabytes on a single frame. GrowEntries stays as the backstop for undercounts.
+        public static void EnsureEntryCapacity(int expected)
+        {
+            if (expected <= Entries.Length) return;
+            int cap = Entries.Length;
+            while (cap < expected && cap < (1 << 30)) cap <<= 1;
+            Entries = new SnapshotEntry[cap];
+        }
+
+        /// Double the entry array, preserving the first `count` entries. Returns the new array
+        /// so the caller can refresh its local copy of the reference.
+        ///
+        /// The save thread reads Entries after ReadyForWrite goes true; that flag is volatile
+        /// and is written last, so the reference published here is visible by the time the
+        /// writer can act on it.
+        public static SnapshotEntry[] GrowEntries(int count)
+        {
+            var next = new SnapshotEntry[Entries.Length * 2];
+            System.Array.Copy(Entries, next, count);
+            Entries = next;
+            return next;
         }
     }
 }

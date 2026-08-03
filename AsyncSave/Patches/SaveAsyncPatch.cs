@@ -27,17 +27,18 @@ namespace AsyncSave.Patches
             long sessionId = SnapshotState.SessionID;
             uint nextUid = SnapshotState.NextUid;
             var entries = SnapshotState.Entries;
+            int entryCount = SnapshotState.EntryCount;
             var removes = SnapshotState.PendingRemoves;
             byte[] buf = SnapshotState.Buffer.Data;
 
             int keptCount = 0;
             if (removes.Count == 0)
             {
-                keptCount = entries.Count;
+                keptCount = entryCount;
             }
             else
             {
-                for (int i = 0; i < entries.Count; ++i)
+                for (int i = 0; i < entryCount; ++i)
                 {
                     if (!removes.Contains(entries[i].Uid)) ++keptCount;
                 }
@@ -53,7 +54,7 @@ namespace AsyncSave.Patches
             // mutated record in place.
             int runOffset = 0;
             int runLength = 0;
-            for (int i = 0; i < entries.Count; ++i)
+            for (int i = 0; i < entryCount; ++i)
             {
                 var e = entries[i];
                 if (removes.Count > 0 && removes.Contains(e.Uid))

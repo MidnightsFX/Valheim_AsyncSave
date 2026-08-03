@@ -97,6 +97,7 @@
     <Compile Include="Snapshot\VerifyHarness.cs" />
     <Compile Include="Snapshot\SliceBudget.cs" />
     <Compile Include="Snapshot\ZdoIdComparer.cs" />
+    <Compile Include="Snapshot\VisitedSet.cs" />
     <Compile Include="Patches\SaveWorldPatch.cs" />
     <Compile Include="Patches\ZoneSaveAsyncPatch.cs" />
     <Compile Include="Patches\ProfileTimingPatches.cs" />
