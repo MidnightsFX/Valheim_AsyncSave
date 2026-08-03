@@ -10,9 +10,12 @@ namespace AsyncSave.Snapshot
         public static readonly SnapshotBuffer Buffer = new SnapshotBuffer(4 * 1024 * 1024);
         public static readonly List<SnapshotEntry> Entries = new List<SnapshotEntry>(65536);
         public static readonly List<ZDOID> PendingAdds = new List<ZDOID>(1024);
-        public static readonly HashSet<ZDOID> PendingRemoves = new HashSet<ZDOID>();
-        // Fast lookup for delta reconciliation: uid -> index into Entries.
-        public static readonly Dictionary<ZDOID, int> EntryIndex = new Dictionary<ZDOID, int>(65536);
+        public static readonly HashSet<ZDOID> PendingRemoves = new HashSet<ZDOID>(ZdoIdComparer.Instance);
+        // Dedup set for the walk. A ZDO that migrates sectors during a yield can appear in
+        // both the old sector's scratch (already processed) and the new one's; Add returns
+        // false on the second sighting. HashSet.Add tests and inserts in a single probe,
+        // which is why this is not a Dictionary - nothing ever needed the index value.
+        public static readonly HashSet<ZDOID> Visited = new HashSet<ZDOID>(ZdoIdComparer.Instance);
         // Per-sector scratch reused across sectors: refs to persistent ZDOs, snapshotted
         // atomically at sector start so mid-sector yields cannot desync from live mutations.
         public static readonly List<ZDO> SectorScratch = new List<ZDO>(4096);
@@ -46,11 +49,18 @@ namespace AsyncSave.Snapshot
         /// Clear per-save state. Buffer and Entries retain their capacity.
         public static void ResetForNewSnapshot()
         {
+            // Both ready flags must be cleared here, not just on consumption: if a save
+            // thread ever dies before reaching ZDOMan.SaveAsync / ZoneSystem.SaveASync the
+            // flag would otherwise survive into the next snapshot and expose a half-built
+            // buffer to the writer.
+            ReadyForWrite = false;
+            ZoneSnapshot.Reset();
+
             Buffer.Reset();
             Entries.Clear();
             PendingAdds.Clear();
             PendingRemoves.Clear();
-            EntryIndex.Clear();
+            Visited.Clear();
             SectorScratch.Clear();
         }
     }

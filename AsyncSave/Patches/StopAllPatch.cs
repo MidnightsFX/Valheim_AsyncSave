@@ -1,4 +1,5 @@
 using HarmonyLib;
+using AsyncSave.Profile;
 using AsyncSave.Snapshot;
 
 namespace AsyncSave.Patches
@@ -11,7 +12,11 @@ namespace AsyncSave.Patches
         static void Prefix(ZNet __instance)
         {
             if (__instance.m_haveStoped) return;
-            if (!SnapshotState.InProgress && !SnapshotState.ReadyForWrite) return;
+
+            // Land any character save before the scene goes away.
+            ProfileSave.DrainToDisk();
+
+            if (!SnapshotState.InProgress && !SnapshotState.ReadyForWrite && !ZoneSnapshot.Ready) return;
             // SaveWorld(true) will invoke our SaveWorldPatch.Prefix which aborts the
             // pending snapshot and re-runs vanilla PrepareSave/SaveAsync synchronously.
             __instance.SaveWorld(true);

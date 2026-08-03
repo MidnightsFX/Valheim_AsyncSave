@@ -28,9 +28,10 @@ namespace AsyncSave.Snapshot
         /// Abort the running snapshot (called by sync-save fallback).
         public static void Abort(string reason)
         {
-            if (!SnapshotState.InProgress && !SnapshotState.ReadyForWrite) return;
+            if (!SnapshotState.InProgress && !SnapshotState.ReadyForWrite && !ZoneSnapshot.Ready) return;
             SnapshotState.InProgress = false;
             SnapshotState.ReadyForWrite = false;
+            ZoneSnapshot.Reset();
             if (_current != null)
             {
                 ZNet.instance.StopCoroutine(_current);
@@ -48,29 +49,44 @@ namespace AsyncSave.Snapshot
             yield return null;
 
             var log = SASettings.Logging.Value;
+            bool phaseTimings = SASettings.PhaseTimings.Value;
             var totalStopwatch = Stopwatch.StartNew();
-            var sliceStopwatch = Stopwatch.StartNew();
-            long longestSliceMs = 0;
-            long sliceStartTicks = 0;
 
-            // Rebuild connection hash data from live connections. Cheap - O(connections).
+            // GetUniqueHash mixes in ZDOExtraData.s_uniqueHashes, which increments per call
+            // and is never reset, so regenerating twice yields different connection hashes.
+            // The verify harness has to rewind it before running vanilla's pass.
+            bool verify = SASettings.VerifyBytes.Value;
+            int savedUniqueHashes = verify ? ZDOExtraData.s_uniqueHashes : 0;
+
+            // Rebuild connection hash data from live connections. O(connections), unsliced.
             ZDOExtraData.RegenerateConnectionHashData();
+            long connMs = totalStopwatch.ElapsedMilliseconds;
 
             int budgetMs = SASettings.SliceBudgetMs.Value;
             int maxPerSlice = SASettings.MaxZdosPerSlice.Value;
             if (budgetMs < 1) budgetMs = 1;
             if (maxPerSlice < 16) maxPerSlice = 16;
 
-            int inSlice = 0;
+            if (verify)
+            {
+                // Byte-identity is only a well-defined property when nothing can mutate
+                // mid-walk. Force the whole snapshot into one un-yielded slice: no yields
+                // means no creates, destroys, mutations or sector migrations, so our entry
+                // order is exactly ZDOMan.GetSaveClone order. This stutters hard on purpose.
+                budgetMs = int.MaxValue;
+                maxPerSlice = int.MaxValue;
+            }
+
+            var slice = SliceBudget.Create(budgetMs, maxPerSlice);
             int serialized = 0;
 
             // Main pass. For each sector we copy the live List<ZDO> refs into a pooled
             // scratch list atomically (no yield during the copy), then yield freely while
             // iterating the stable scratch. This is what protects us from the "ZDO removed
             // mid-yield shifts sector indices and we skip an element" data-loss bug.
-            // Dedup is via EntryIndex - a ZDO that migrates sectors during a yield may
-            // appear in both the old sector's scratch (already processed) and the new
-            // sector's scratch (about to process); the EntryIndex check drops the duplicate.
+            // Dedup is via SnapshotState.Visited - a ZDO that migrates sectors during a
+            // yield may appear in both the old sector's scratch (already processed) and the
+            // new sector's scratch (about to process); Visited.Add drops the duplicate.
             var scratch = SnapshotState.SectorScratch;
             var sectors = zdoMan.m_objectsBySector;
             for (int s = 0; s < sectors.Length; ++s)
@@ -80,27 +96,21 @@ namespace AsyncSave.Snapshot
 
                 // Atomic copy: no yields, no possible concurrent mutation.
                 scratch.Clear();
-                for (int i = 0; i < live.Count; ++i) scratch.Add(live[i]);
+                scratch.AddRange(live);
 
-                for (int i = 0; i < scratch.Count; ++i)
+                int i = 0;
+                while (i < scratch.Count)
                 {
-                    var zdo = scratch[i];
-                    if (!zdo.Persistent) continue;
-                    if (SnapshotState.EntryIndex.ContainsKey(zdo.m_uid)) continue;
-                    SerializeAndRecord(zdo);
-                    ++serialized;
-                    ++inSlice;
-
-                    if (inSlice >= maxPerSlice || sliceStopwatch.ElapsedMilliseconds - sliceStartTicks >= budgetMs)
+                    i = SerializeRange(scratch, i, ref slice, ref serialized);
+                    if (i < scratch.Count)
                     {
-                        long elapsed = sliceStopwatch.ElapsedMilliseconds - sliceStartTicks;
-                        if (elapsed > longestSliceMs) longestSliceMs = elapsed;
+                        slice.EndSlice();
                         yield return null;
-                        inSlice = 0;
-                        sliceStartTicks = sliceStopwatch.ElapsedMilliseconds;
+                        slice.BeginSlice();
                     }
                 }
             }
+            long sectorMs = totalStopwatch.ElapsedMilliseconds;
 
             // Outside-sector map: flatten all values into scratch in one atomic pass so we
             // never hold a dictionary enumerator across a yield (would throw on mutation).
@@ -109,23 +119,19 @@ namespace AsyncSave.Snapshot
             {
                 var live = kv.Value;
                 if (live == null) continue;
-                for (int i = 0; i < live.Count; ++i) scratch.Add(live[i]);
+                scratch.AddRange(live);
             }
-            for (int i = 0; i < scratch.Count; ++i)
             {
-                var zdo = scratch[i];
-                if (!zdo.Persistent) continue;
-                if (SnapshotState.EntryIndex.ContainsKey(zdo.m_uid)) continue;
-                SerializeAndRecord(zdo);
-                ++serialized;
-                ++inSlice;
-                if (inSlice >= maxPerSlice || sliceStopwatch.ElapsedMilliseconds - sliceStartTicks >= budgetMs)
+                int i = 0;
+                while (i < scratch.Count)
                 {
-                    long elapsed = sliceStopwatch.ElapsedMilliseconds - sliceStartTicks;
-                    if (elapsed > longestSliceMs) longestSliceMs = elapsed;
-                    yield return null;
-                    inSlice = 0;
-                    sliceStartTicks = sliceStopwatch.ElapsedMilliseconds;
+                    i = SerializeRange(scratch, i, ref slice, ref serialized);
+                    if (i < scratch.Count)
+                    {
+                        slice.EndSlice();
+                        yield return null;
+                        slice.BeginSlice();
+                    }
                 }
             }
             scratch.Clear();
@@ -138,58 +144,32 @@ namespace AsyncSave.Snapshot
             if (SASettings.DeltaReconciliation.Value)
             {
                 var entries = SnapshotState.Entries;
-                for (int i = 0; i < entries.Count; ++i)
+                int i = 0;
+                while (i < entries.Count)
                 {
-                    var e = entries[i];
-                    var live = zdoMan.GetZDO(e.Uid);
-                    if (live == null)
+                    i = ReconcileRange(zdoMan, i, ref slice, ref reconciledMutations);
+                    if (i < entries.Count)
                     {
-                        // If a remove happened after we serialized, RemoveFromSector patch
-                        // put it in PendingRemoves - we'll skip it at write time. Nothing to do.
-                        continue;
-                    }
-                    if (live.DataRevision != e.DataRevision)
-                    {
-                        // Rewrite at buffer tail; update the entry's offset/length/rev.
-                        int newOffset = SnapshotState.Buffer.Position;
-                        int newLength = ZdoSerializer.Write(live, SnapshotState.Buffer);
-                        e.Offset = newOffset;
-                        e.Length = newLength;
-                        e.DataRevision = live.DataRevision;
-                        entries[i] = e;
-                        ++reconciledMutations;
-                        ++inSlice;
-                        if (inSlice >= maxPerSlice || sliceStopwatch.ElapsedMilliseconds - sliceStartTicks >= budgetMs)
-                        {
-                            long elapsed = sliceStopwatch.ElapsedMilliseconds - sliceStartTicks;
-                            if (elapsed > longestSliceMs) longestSliceMs = elapsed;
-                            yield return null;
-                            inSlice = 0;
-                            sliceStartTicks = sliceStopwatch.ElapsedMilliseconds;
-                        }
+                        slice.EndSlice();
+                        yield return null;
+                        slice.BeginSlice();
                     }
                 }
             }
 
             // Append pending adds.
-            var pendingAdds = SnapshotState.PendingAdds;
-            for (int i = 0; i < pendingAdds.Count; ++i)
             {
-                var uid = pendingAdds[i];
-                if (SnapshotState.EntryIndex.ContainsKey(uid)) continue; // already serialized in main pass
-                if (SnapshotState.PendingRemoves.Contains(uid)) continue; // added then removed
-                var live = zdoMan.GetZDO(uid);
-                if (live == null || !live.Persistent) continue;
-                SerializeAndRecord(live);
-                ++appendedAdds;
-                ++inSlice;
-                if (inSlice >= maxPerSlice || sliceStopwatch.ElapsedMilliseconds - sliceStartTicks >= budgetMs)
+                var pendingAdds = SnapshotState.PendingAdds;
+                int i = 0;
+                while (i < pendingAdds.Count)
                 {
-                    long elapsed = sliceStopwatch.ElapsedMilliseconds - sliceStartTicks;
-                    if (elapsed > longestSliceMs) longestSliceMs = elapsed;
-                    yield return null;
-                    inSlice = 0;
-                    sliceStartTicks = sliceStopwatch.ElapsedMilliseconds;
+                    i = AppendAddsRange(zdoMan, i, ref slice, ref appendedAdds);
+                    if (i < pendingAdds.Count)
+                    {
+                        slice.EndSlice();
+                        yield return null;
+                        slice.BeginSlice();
+                    }
                 }
             }
 
@@ -198,8 +178,15 @@ namespace AsyncSave.Snapshot
             // Freeze nextUid AFTER the snapshot walk - covers any uids created during yields.
             SnapshotState.NextUid = zdoMan.m_nextUid;
 
-            // Prepare small side-systems synchronously (they're cheap).
-            ZoneSystem.instance.PrepareSave();
+            // Vanilla's ZoneSystem.PrepareSave rehashes every generated zone into a new
+            // HashSet and copies every location instance into a new List - tens of ms and a
+            // multi-megabyte allocation in a single frame. Capture into pooled arrays
+            // instead. Atomic (no yields), same enumeration order, so the bytes match.
+            long zoneStartMs = totalStopwatch.ElapsedMilliseconds;
+            ZoneSnapshot.Capture(ZoneSystem.instance);
+            long zoneMs = totalStopwatch.ElapsedMilliseconds - zoneStartMs;
+
+            // Four field copies - nothing to optimise.
             RandEventSystem.instance.PrepareSave();
 
             // Reset the save-thread start clock so vanilla timing telemetry is meaningful.
@@ -208,35 +195,159 @@ namespace AsyncSave.Snapshot
             totalStopwatch.Stop();
             SnapshotState.InProgress = false;
             SnapshotState.ReadyForWrite = true;
+            ZoneSnapshot.Ready = true;
+
+            // Must run before the save thread is released - it serializes both ways into
+            // memory and needs exclusive access to the snapshot and to vanilla's temps.
+            if (verify) VerifyHarness.Compare(zdoMan, savedUniqueHashes);
+
             _current = null;
             tcs.TrySetResult(true);
+
+            if (phaseTimings)
+            {
+                Log.Info($"AsyncSave phases: connHash={connMs}ms sectorWalk={sectorMs - connMs}ms " +
+                         $"outsideSector={reconStartMs - sectorMs}ms reconcile+adds={reconMs}ms " +
+                         $"zoneCapture={zoneMs}ms (zones={ZoneSnapshot.ZoneCount} locations={ZoneSnapshot.LocationCount}) " +
+                         $"total={totalStopwatch.ElapsedMilliseconds}ms longestSlice={slice.LongestMs}ms");
+            }
 
             int keptCount = SnapshotState.Entries.Count - SnapshotState.PendingRemoves.Count;
             if (log == SALogLevel.Simple)
             {
-                Log.Info($"AsyncSave snapshot: {keptCount} ZDOs in {totalStopwatch.ElapsedMilliseconds} ms (longest slice: {longestSliceMs} ms).");
+                Log.Info($"AsyncSave snapshot: {keptCount} ZDOs in {totalStopwatch.ElapsedMilliseconds} ms (longest slice: {slice.LongestMs} ms).");
             }
             else if (log == SALogLevel.Detailed)
             {
                 Log.Info($"AsyncSave snapshot: serialized={serialized} reconciled={reconciledMutations} adds={appendedAdds} removes={SnapshotState.PendingRemoves.Count} kept={keptCount} " +
                          $"buffer={SnapshotState.Buffer.Position} bytes cap={SnapshotState.Buffer.Data.Length} " +
-                         $"total={totalStopwatch.ElapsedMilliseconds}ms recon={reconMs}ms longestSlice={longestSliceMs}ms");
+                         $"total={totalStopwatch.ElapsedMilliseconds}ms recon={reconMs}ms longestSlice={slice.LongestMs}ms");
             }
         }
 
-        private static void SerializeAndRecord(ZDO zdo)
+        // The three loops below live outside the iterator on purpose. Inside a C# iterator
+        // every local becomes a field on the compiler-generated state machine, so each
+        // access is a memory load instead of a register - measurable when the loop body is
+        // this short and runs a hundred thousand times. Each returns the index to resume at;
+        // the caller owns the yield, since yield return cannot cross a call boundary.
+
+        private static int SerializeRange(System.Collections.Generic.List<ZDO> scratch, int from,
+                                          ref SliceBudget slice, ref int serialized)
         {
-            int offset = SnapshotState.Buffer.Position;
-            int length = ZdoSerializer.Write(zdo, SnapshotState.Buffer);
-            var entry = new SnapshotEntry
+            var visited = SnapshotState.Visited;
+            var buffer = SnapshotState.Buffer;
+            var entries = SnapshotState.Entries;
+            int n = scratch.Count;
+            int count = serialized;
+
+            for (int i = from; i < n; ++i)
             {
-                Uid = zdo.m_uid,
-                Offset = offset,
-                Length = length,
-                DataRevision = zdo.DataRevision,
-            };
-            SnapshotState.EntryIndex[zdo.m_uid] = SnapshotState.Entries.Count;
-            SnapshotState.Entries.Add(entry);
+                var zdo = scratch[i];
+                if (!zdo.Persistent) continue;
+                if (!visited.Add(zdo.m_uid)) continue;
+
+                int offset = buffer.Position;
+                int length = ZdoSerializer.Write(zdo, buffer);
+                entries.Add(new SnapshotEntry
+                {
+                    Uid = zdo.m_uid,
+                    Offset = offset,
+                    Length = length,
+                    DataRevision = zdo.DataRevision,
+                });
+                ++count;
+
+                if (slice.Step()) { serialized = count; return i + 1; }
+            }
+
+            serialized = count;
+            return n;
+        }
+
+        private static int ReconcileRange(ZDOMan zdoMan, int from, ref SliceBudget slice, ref int reconciled)
+        {
+            var entries = SnapshotState.Entries;
+            var buffer = SnapshotState.Buffer;
+            int n = entries.Count;
+            int count = reconciled;
+
+            for (int i = from; i < n; ++i)
+            {
+                var e = entries[i];
+                var live = zdoMan.GetZDO(e.Uid);
+                if (live == null)
+                {
+                    // If a remove happened after we serialized, the sector patch put it in
+                    // PendingRemoves - we skip it at write time. Nothing to do here.
+                    continue;
+                }
+                if (live.DataRevision == e.DataRevision) continue;
+
+                // Rewrite in place when the new encoding cannot outgrow the old one. That
+                // keeps entry offsets monotonic, which is what lets the write phase coalesce
+                // the whole block into a single stream write, and stops the buffer's
+                // high-water mark from creeping up over a long session.
+                int tail = buffer.Position;
+                buffer.Position = e.Offset;
+                int newLength = ZdoSerializer.Write(live, buffer, e.Length);
+                buffer.Position = tail;
+
+                if (newLength < 0)
+                {
+                    // Did not fit - append at the tail and orphan the original bytes.
+                    e.Offset = buffer.Position;
+                    e.Length = ZdoSerializer.Write(live, buffer);
+                }
+                else
+                {
+                    e.Length = newLength;
+                }
+
+                e.DataRevision = live.DataRevision;
+                entries[i] = e;
+                ++count;
+
+                if (slice.Step()) { reconciled = count; return i + 1; }
+            }
+
+            reconciled = count;
+            return n;
+        }
+
+        private static int AppendAddsRange(ZDOMan zdoMan, int from, ref SliceBudget slice, ref int appended)
+        {
+            var pendingAdds = SnapshotState.PendingAdds;
+            var removes = SnapshotState.PendingRemoves;
+            var visited = SnapshotState.Visited;
+            var buffer = SnapshotState.Buffer;
+            var entries = SnapshotState.Entries;
+            int n = pendingAdds.Count;
+            int count = appended;
+
+            for (int i = from; i < n; ++i)
+            {
+                var uid = pendingAdds[i];
+                if (removes.Contains(uid)) continue;      // added then removed
+                if (!visited.Add(uid)) continue;          // already serialized in the main pass
+                var live = zdoMan.GetZDO(uid);
+                if (live == null || !live.Persistent) continue;
+
+                int offset = buffer.Position;
+                int length = ZdoSerializer.Write(live, buffer);
+                entries.Add(new SnapshotEntry
+                {
+                    Uid = uid,
+                    Offset = offset,
+                    Length = length,
+                    DataRevision = live.DataRevision,
+                });
+                ++count;
+
+                if (slice.Step()) { appended = count; return i + 1; }
+            }
+
+            appended = count;
+            return n;
         }
     }
 }

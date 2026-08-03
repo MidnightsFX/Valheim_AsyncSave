@@ -13,7 +13,7 @@
     <FileAlignment>512</FileAlignment>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -68,6 +68,11 @@
       <HintPath>$(GamePath)\valheim_Data\Managed\publicized_assemblies\assembly_utils_publicized.dll</HintPath>
       <SpecificVersion>false</SpecificVersion>
     </Reference>
+    <!-- PlatformUserID (map pin authors) lives here. -->
+    <Reference Include="Splatform">
+      <HintPath>$(GamePath)\valheim_Data\Managed\publicized_assemblies\Splatform_publicized.dll</HintPath>
+      <SpecificVersion>false</SpecificVersion>
+    </Reference>
     <Reference Include="UnityEngine">
       <HintPath>$(GamePath)\valheim_Data\Managed\UnityEngine.dll</HintPath>
       <SpecificVersion>false</SpecificVersion>
@@ -88,7 +93,21 @@
     <Compile Include="Snapshot\SnapshotState.cs" />
     <Compile Include="Snapshot\ZdoSerializer.cs" />
     <Compile Include="Snapshot\SnapshotCoroutine.cs" />
+    <Compile Include="Snapshot\ZoneSnapshot.cs" />
+    <Compile Include="Snapshot\VerifyHarness.cs" />
+    <Compile Include="Snapshot\SliceBudget.cs" />
+    <Compile Include="Snapshot\ZdoIdComparer.cs" />
     <Compile Include="Patches\SaveWorldPatch.cs" />
+    <Compile Include="Patches\ZoneSaveAsyncPatch.cs" />
+    <Compile Include="Patches\ProfileTimingPatches.cs" />
+    <Compile Include="Profile\MapSnapshot.cs" />
+    <Compile Include="Profile\ProfileFormat.cs" />
+    <Compile Include="Profile\ProfileSave.cs" />
+    <Compile Include="Profile\ProfileVerify.cs" />
+    <Compile Include="Profile\SaveIo.cs" />
+    <Compile Include="Patches\SavePlayerProfilePatch.cs" />
+    <Compile Include="Patches\SavePlayerToDiskPatch.cs" />
+    <Compile Include="Patches\ShutdownPatches.cs" />
     <Compile Include="Patches\SaveWorldThreadPatch.cs" />
     <Compile Include="Patches\SaveAsyncPatch.cs" />
     <Compile Include="Patches\SectorPatches.cs" />

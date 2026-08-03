@@ -15,6 +15,9 @@ namespace AsyncSave.Patches
     {
         static bool Prefix(BinaryWriter writer)
         {
+            // The verify harness runs this method twice: once for us, once for vanilla.
+            if (VerifyHarness.Bypass) return true;
+
             if (!SnapshotState.ReadyForWrite)
             {
                 // No snapshot ready (sync save via vanilla PrepareSave path). Let vanilla run.
@@ -44,12 +47,33 @@ namespace AsyncSave.Patches
             writer.Write(nextUid);
             writer.Write(keptCount);
 
+            // Entries are laid down back to back, so in the common case the whole block is
+            // one contiguous range and this collapses to a single stream write. Runs break
+            // only where a ZDO was skipped or where reconciliation could not rewrite a
+            // mutated record in place.
+            int runOffset = 0;
+            int runLength = 0;
             for (int i = 0; i < entries.Count; ++i)
             {
                 var e = entries[i];
-                if (removes.Count > 0 && removes.Contains(e.Uid)) continue;
-                writer.Write(buf, e.Offset, e.Length);
+                if (removes.Count > 0 && removes.Contains(e.Uid))
+                {
+                    if (runLength > 0) { writer.Write(buf, runOffset, runLength); runLength = 0; }
+                    continue;
+                }
+
+                if (runLength > 0 && e.Offset == runOffset + runLength)
+                {
+                    runLength += e.Length;
+                }
+                else
+                {
+                    if (runLength > 0) writer.Write(buf, runOffset, runLength);
+                    runOffset = e.Offset;
+                    runLength = e.Length;
+                }
             }
+            if (runLength > 0) writer.Write(buf, runOffset, runLength);
 
             if (SASettings.Logging.Value == SALogLevel.Detailed)
             {

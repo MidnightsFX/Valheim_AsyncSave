@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using HarmonyLib;
 using AsyncSave.Snapshot;
 using AsyncSave.Util;
+using SASettings = AsyncSave.Config.Settings;
 
 namespace AsyncSave.Patches
 {
@@ -12,12 +13,20 @@ namespace AsyncSave.Patches
     ///  - if snapshot in progress and sync arrives: abort snapshot, reset TCS to
     ///    completed-true so vanilla's fresh SaveWorldThread proceeds, then let vanilla run
     ///  - if snapshot in progress and async arrives: drop the duplicate save
-    ///  - otherwise: transpile the async path to skip ZDOMan.PrepareSave and start our coroutine
+    ///  - otherwise: transpile the async path to skip all three PrepareSave calls and start
+    ///    our coroutine, which performs the equivalent work itself
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.SaveWorld))]
     internal static class SaveWorldPatch
     {
+        /// Set if the transpiler could not find the call sequence it needs. The method body
+        /// is then left exactly as vanilla wrote it, and every other entry point in the mod
+        /// stands down so we never half-apply.
+        internal static bool TranspilerFailed;
+
         static bool Prefix(bool sync)
         {
+            if (TranspilerFailed) return true;
+
             if (SnapshotState.Task.Task.IsCompleted && !SnapshotState.InProgress)
             {
                 return true;
@@ -39,56 +48,99 @@ namespace AsyncSave.Patches
             return false;
         }
 
-        // Transpile:
-        //   ...
-        //   this.m_zdoMan.PrepareSave();
-        //   ZoneSystem.instance.PrepareSave();
-        //   ...
-        // Into:
-        //   ...
-        //   if (!sync) { AsyncSaveStart(this.m_zdoMan); goto AfterPrepareSave; }
-        //   this.m_zdoMan.PrepareSave();
-        //   AfterPrepareSave:
-        //   ZoneSystem.instance.PrepareSave();
-        //   ...
+        // Vanilla ZNet.SaveWorld runs three PrepareSave calls back to back:
+        //
+        //   ldarg.0; ldfld m_zdoMan;             callvirt ZDOMan.PrepareSave()
+        //   call ZoneSystem.get_instance();      callvirt ZoneSystem.PrepareSave()
+        //   call RandEventSystem.get_instance(); callvirt RandEventSystem.PrepareSave()
+        //
+        // All three are unsliced main-thread work, and the coroutine performs the equivalent
+        // of all three itself at the end of its walk. Bypassing them with one branch that
+        // spans the whole run turns the trigger frame into a thread spawn and nothing else.
+        //
+        // One branch rather than three: the receiver for each call is pushed by the
+        // instructions immediately preceding it, so three separate branches would strand
+        // those get_instance calls. With a single branch the stack is trivially verifiable -
+        // doCustom is only ever reached at depth 1 (the ZDOMan receiver, consumed by
+        // AsyncSaveStart) and afterAll only ever at depth 0 from both sides.
         static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator il)
         {
-            MethodInfo prepareSave = AccessTools.DeclaredMethod(typeof(ZDOMan), nameof(ZDOMan.PrepareSave));
+            var code = new List<CodeInstruction>(instructions);
+
+            MethodInfo zdoPrepare = AccessTools.DeclaredMethod(typeof(ZDOMan), nameof(ZDOMan.PrepareSave));
+            MethodInfo zonePrepare = AccessTools.DeclaredMethod(typeof(ZoneSystem), nameof(ZoneSystem.PrepareSave));
+            MethodInfo randPrepare = AccessTools.DeclaredMethod(typeof(RandEventSystem), nameof(RandEventSystem.PrepareSave));
             MethodInfo customStart = AccessTools.DeclaredMethod(typeof(SaveWorldPatch), nameof(AsyncSaveStart));
-            bool insertJumpTarget = false;
-            Label doCustomLabel = il.DefineLabel();
 
-            foreach (var ins in instructions)
+            int iZdo = zdoPrepare == null ? -1 : code.FindIndex(c => c.Calls(zdoPrepare));
+            int iZone = (iZdo < 0 || zonePrepare == null) ? -1 : code.FindIndex(iZdo + 1, c => c.Calls(zonePrepare));
+            int iRand = (iZone < 0 || randPrepare == null) ? -1 : code.FindIndex(iZone + 1, c => c.Calls(randPrepare));
+
+            bool ok = iZdo >= 0 && iZone >= 0 && iRand >= 0 && iRand + 1 < code.Count;
+
+            // Nothing may branch into the region we are about to bypass, or the jump would
+            // land mid-region with the wrong stack depth.
+            if (ok)
             {
-                if (insertJumpTarget)
+                for (int i = iZdo; i <= iRand; ++i)
                 {
-                    insertJumpTarget = false;
-                    Label endLabel = il.DefineLabel();
-                    yield return new CodeInstruction(OpCodes.Br, endLabel);
-                    yield return new CodeInstruction(OpCodes.Call, customStart) { labels = { doCustomLabel } };
-                    ins.labels.Add(endLabel);
+                    if (code[i].labels.Count > 0) { ok = false; break; }
                 }
-
-                if (ins.opcode == OpCodes.Callvirt && ins.OperandIs(prepareSave))
-                {
-                    // At this point, the stack has: ZDOMan_instance (already pushed).
-                    // We consume that by calling AsyncSaveStart (static, one arg = ZDOMan).
-                    // The 'sync' bool (arg1) determines whether to take the custom branch.
-                    yield return new CodeInstruction(OpCodes.Ldarg_1); // sync
-                    yield return new CodeInstruction(OpCodes.Brfalse, doCustomLabel);
-                    insertJumpTarget = true;
-                }
-
-                yield return ins;
             }
+
+            if (!ok)
+            {
+                TranspilerFailed = true;
+                Log.Error("AsyncSave: could not locate the ZDOMan/ZoneSystem/RandEventSystem PrepareSave " +
+                          "sequence in ZNet.SaveWorld. Async save is disabled; the vanilla save path is " +
+                          "left completely intact. This usually means the game updated.");
+                return code;
+            }
+
+            Label doCustom = il.DefineLabel();
+            Label afterAll = il.DefineLabel();
+
+            // Tail insert first so iZdo stays valid.
+            code[iRand + 1].labels.Add(afterAll);
+            code.InsertRange(iRand + 1, new[]
+            {
+                new CodeInstruction(OpCodes.Br, afterAll),
+                new CodeInstruction(OpCodes.Call, customStart) { labels = { doCustom } },
+            });
+
+            // Head insert: at iZdo the ZDOMan receiver is already on the stack.
+            code.InsertRange(iZdo, new[]
+            {
+                new CodeInstruction(OpCodes.Ldarg_1),            // sync
+                new CodeInstruction(OpCodes.Brfalse, doCustom),
+            });
+
+            return code;
         }
 
-        // Called from transpiled ZNet.SaveWorld when !sync.
-        // Consumes the ZDOMan instance that was already pushed onto the stack (would have
-        // been the receiver for PrepareSave); we use it to start our coroutine.
+        // Called from transpiled ZNet.SaveWorld when !sync. Consumes the ZDOMan instance that
+        // was already pushed onto the stack (it would have been the receiver for PrepareSave).
         public static void AsyncSaveStart(ZDOMan zdoMan)
         {
-            SnapshotCoroutine.Start(zdoMan);
+            if (SASettings.WorldSaveEnabled.Value)
+            {
+                SnapshotCoroutine.Start(zdoMan);
+                return;
+            }
+
+            // Kill switch: do exactly what the branch above skipped, then hand the save
+            // thread a completed gate so it proceeds down the untouched vanilla path.
+            zdoMan.PrepareSave();
+            ZoneSystem.instance.PrepareSave();
+            RandEventSystem.instance.PrepareSave();
+
+            SnapshotState.InProgress = false;
+            SnapshotState.ReadyForWrite = false;
+            ZoneSnapshot.Reset();
+
+            var done = new TaskCompletionSource<bool>();
+            done.SetResult(true);
+            SnapshotState.Task = done;
         }
     }
 }
