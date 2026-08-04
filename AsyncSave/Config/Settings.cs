@@ -9,6 +9,19 @@ namespace AsyncSave.Config
         Detailed,
     }
 
+    /// How mutations that land during snapshot yields are re-serialized.
+    internal enum ReconcileMode
+    {
+        /// No reconciliation. Mutations mid-snapshot are saved one revision stale.
+        Off,
+        /// Re-serialize only the ZDOs our revision hooks flagged. O(mutations).
+        Dirty,
+        /// Re-scan every entry against live DataRevision. O(world) - the pre-0.3 behaviour.
+        FullScan,
+        /// Dirty pass, then a full scan that reports anything the hooks missed. Diagnostic.
+        Verify,
+    }
+
     internal static class Settings
     {
         // 1 - General
@@ -19,14 +32,16 @@ namespace AsyncSave.Config
         public static ConfigEntry<bool> WorldSaveEnabled;
         public static ConfigEntry<int> SliceBudgetMs;
         public static ConfigEntry<bool> AdaptiveBudget;
+        public static ConfigEntry<int> FrameHeadroomPercent;
         public static ConfigEntry<int> MaxZdosPerSlice;
-        public static ConfigEntry<bool> DeltaReconciliation;
+        public static ConfigEntry<ReconcileMode> DeltaReconciliation;
 
         // 3 - Character Save (client side; also covers the server's own Developer.fch)
         public static ConfigEntry<bool> CharacterSaveEnabled;
 
         // 4 - Debug
         public static ConfigEntry<bool> PhaseTimings;
+        public static ConfigEntry<int> HitchThresholdMs;
         public static ConfigEntry<bool> VerifyBytes;
 
         public static void Bind(ConfigFile cfg)
@@ -66,6 +81,16 @@ namespace AsyncSave.Config
                 "little when the game is struggling - at the price of a longer save window. " +
                 "Turn off for a fixed budget and the shortest possible save.");
 
+            FrameHeadroomPercent = cfg.Bind(
+                "2 - World Save", "Frame headroom (%)", 25,
+                new ConfigDescription(
+                    "How much longer a frame is allowed to take while a save runs, as a percentage " +
+                    "of what that frame costs without us. 25 means a 4 ms frame may become 5 ms. " +
+                    "This is what keeps the cost proportional: budgeting against a flat 60 FPS target " +
+                    "authorises a 4x frame-time increase on a machine already running at 230 FPS. " +
+                    "Lower = smoother but longer saves. Ignored when the adaptive budget is off.",
+                    new AcceptableValueRange<int>(5, 200)));
+
             MaxZdosPerSlice = cfg.Bind(
                 "2 - World Save", "Max ZDOs per slice", 50000,
                 "Safety valve: hard cap on ZDOs examined per slice, regardless of the time budget. " +
@@ -74,8 +99,13 @@ namespace AsyncSave.Config
                 "budget and stretches the save out.");
 
             DeltaReconciliation = cfg.Bind(
-                "2 - World Save", "Reconcile mutations", true,
-                "Re-serialize any ZDO whose DataRevision changed during snapshot yields. Disable only for benchmarking - saves will otherwise be one revision stale for mutations that happen mid-snapshot.");
+                "2 - World Save", "Reconcile mutations", ReconcileMode.Dirty,
+                "Re-serialize any ZDO whose DataRevision changed during snapshot yields, so a save is " +
+                "not one revision stale for mutations that land mid-snapshot. " +
+                "Dirty re-serializes only what the revision hooks flagged and costs nothing on an idle " +
+                "world. FullScan re-checks every ZDO against live state - correct regardless of hook " +
+                "coverage, but it walks the whole world every save. Verify runs both and logs anything " +
+                "Dirty missed; use it to validate the hooks, not in normal play. Off skips the pass.");
 
             CharacterSaveEnabled = cfg.Bind(
                 "3 - Character Save", "Enabled", true,
@@ -89,6 +119,15 @@ namespace AsyncSave.Config
                 "4 - Debug", "Log phase timings", false,
                 "Log per-phase millisecond timings for each save, on both the main thread and the " +
                 "save worker. Diagnostic only.");
+
+            HitchThresholdMs = cfg.Bind(
+                "4 - Debug", "Hitch threshold (ms)", 16,
+                new ConfigDescription(
+                    "With phase timings on, record every main-thread block that ran longer than this " +
+                    "and report the worst of them at the end of the save, with the phase it was in and " +
+                    "whether a GC or a pool growth happened inside it. The single worst-block number on " +
+                    "its own cannot tell one big stall apart from fifty medium ones.",
+                    new AcceptableValueRange<int>(1, 10000)));
 
             VerifyBytes = cfg.Bind(
                 "4 - Debug", "Verify save bytes", false,

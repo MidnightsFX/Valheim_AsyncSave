@@ -18,6 +18,10 @@ namespace AsyncSave.Snapshot
 
         public static readonly List<ZDOID> PendingAdds = new List<ZDOID>(1024);
         public static readonly HashSet<ZDOID> PendingRemoves = new HashSet<ZDOID>(ZdoIdComparer.Instance);
+        // ZDOs whose data changed after we serialized them, fed by ZdoRevisionPatches while
+        // InProgress. Reconciliation walks this instead of re-checking the whole world: the
+        // full scan cost 5.3 s of main thread on a 4.9 M-ZDO world to find 21 changes.
+        public static readonly HashSet<ZDOID> PendingDirty = new HashSet<ZDOID>(ZdoIdComparer.Instance);
         // Dedup set for the walk. A ZDO that migrates sectors during a yield can appear in
         // both the old sector's scratch (already processed) and the new one's; Add returns
         // false on the second sighting. Add tests and inserts in a single probe, which is why
@@ -26,6 +30,10 @@ namespace AsyncSave.Snapshot
         // Per-sector scratch reused across sectors: refs to persistent ZDOs, snapshotted
         // atomically at sector start so mid-sector yields cannot desync from live mutations.
         public static readonly List<ZDO> SectorScratch = new List<ZDO>(4096);
+        // Drain target for PendingDirty, same reason as SectorScratch: the revision patches
+        // keep adding while reconciliation yields, and a live HashSet enumerator throws the
+        // moment one does.
+        public static readonly List<ZDOID> DirtyScratch = new List<ZDOID>(1024);
 
         /// True while the coroutine walks the world. Sector patches check this flag
         /// to append to PendingAdds / PendingRemoves; false = zero-cost pass-through.
@@ -45,6 +53,30 @@ namespace AsyncSave.Snapshot
         /// Signals SaveWorldThread to proceed. Set to a completed source at boot so
         /// the first vanilla save (if any) doesn't block.
         public static TaskCompletionSource<bool> Task = InitiallyCompleted();
+
+        /// Rolling estimate of the encoded size of one ZDO, used to size the buffer up front.
+        /// Seeded just above the ~52 bytes measured on a 4.9 M-ZDO world - close enough that
+        /// the first save rarely has to grow, low enough that the seed does not itself become
+        /// the overshoot the presize exists to avoid. Survives across saves; the buffer never
+        /// shrinks, so one generous allocation beats a doubling chain every time.
+        public static float BytesPerZdoEma = 56f;
+
+        /// Fold the last save's measurement into the estimate.
+        public static void RecordBytesPerZdo(int bytes, int count)
+        {
+            if (count <= 0) return;
+            float sample = (float)bytes / count;
+            BytesPerZdoEma += (sample - BytesPerZdoEma) * 0.5f;
+        }
+
+        /// Current capacity of each pool. Sampled by SliceBudget on both sides of a block so a
+        /// hitch can be attributed to a growth that happened inside it.
+        public static void CurrentCaps(out int buffer, out int entries, out int visited)
+        {
+            buffer = Buffer.Data.Length;
+            entries = Entries.Length;
+            visited = Visited.Capacity;
+        }
 
         private static TaskCompletionSource<bool> InitiallyCompleted()
         {
@@ -70,8 +102,10 @@ namespace AsyncSave.Snapshot
             EntryCount = 0;
             PendingAdds.Clear();
             PendingRemoves.Clear();
+            PendingDirty.Clear();
             Visited.Clear();
             SectorScratch.Clear();
+            DirtyScratch.Clear();
         }
 
         /// Size the entry array for an expected ZDO count. Only valid while EntryCount is 0:

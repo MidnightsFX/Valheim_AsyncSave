@@ -23,9 +23,24 @@ namespace AsyncSave.Patches
         /// stands down so we never half-apply.
         internal static bool TranspilerFailed;
 
-        static bool Prefix(bool sync)
+        static bool Prefix(ZNet __instance, bool sync)
         {
             if (TranspilerFailed) return true;
+
+            // ZNet.SaveWorld opens with `if (m_saveThread.IsAlive) m_saveThread.Join()` - an
+            // unbounded main-thread block waiting on a background thread that is streaming a
+            // quarter of a gigabyte to disk. The snapshot guards below only cover the window
+            // where our coroutine is still walking; once it publishes, the writer is running
+            // and vanilla would happily freeze the game on it. An autosave has no deadline, so
+            // drop it and let the writer finish - the next one lands on the normal interval.
+            //
+            // The sync path deliberately falls through: a shutdown or manual save must
+            // complete, and joining the previous writer first is the correct thing to do.
+            if (!sync && __instance.m_saveThread != null && __instance.m_saveThread.IsAlive)
+            {
+                Log.Info("AsyncSave: previous world save is still writing to disk - skipping this autosave.");
+                return false;
+            }
 
             if (SnapshotState.Task.Task.IsCompleted && !SnapshotState.InProgress)
             {

@@ -1,9 +1,40 @@
+using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text;
 using UnityEngine;
 
 namespace AsyncSave.Snapshot
 {
+    /// Which part of the walk a main-thread block belonged to. Recorded per hitch so a spike
+    /// can be attributed to a phase instead of just to "the save".
+    internal enum SlicePhase : byte
+    {
+        Presize,
+        SectorWalk,
+        OutsideSector,
+        Reconcile,
+        Adds,
+        Tail,
+    }
+
+    /// One main-thread block that ran past the hitch threshold.
+    internal struct HitchRecord
+    {
+        public int Block;
+        public SlicePhase Phase;
+        public float Ms;
+        public int Gen0;
+        public int Gen1;
+        public int Gen2;
+        public int BufferCapBefore;
+        public int BufferCapAfter;
+        public int EntriesCapBefore;
+        public int EntriesCapAfter;
+        public int VisitedCapBefore;
+        public int VisitedCapAfter;
+    }
+
     /// Per-frame time budget for the snapshot walk.
     ///
     /// The previous inline check called Stopwatch.ElapsedMilliseconds on every single ZDO:
@@ -35,6 +66,10 @@ namespace AsyncSave.Snapshot
 
         private const float DefaultTargetFrameMs = 1000f / 60f;
 
+        /// How many of the worst blocks are kept. Insertion is O(HitchSlots) but only runs
+        /// for blocks that already exceeded the threshold, which should be a handful per save.
+        private const int HitchSlots = 8;
+
         private long _budgetTicks;
         private int _maxPerSlice;
         private int _inSlice;
@@ -44,19 +79,33 @@ namespace AsyncSave.Snapshot
 
         private bool _adaptive;
         private float _maxBudgetMs;
-        private float _targetFrameMs;
-        private float _baseFrameEmaMs;   // negative until the first sample
+        private float _headroom;
+        private float _capTargetMs;        // explicit fps cap / vsync interval, else 60 Hz
+        private float _targetFrameMs;      // effective target after the proportional rule
+        private float _baseFrameEmaMs;     // negative until the first sample
         private float _lastSliceMs;
+        private float _lastBudgetMs;
         private float _ticksPerMs;
 
-        public static SliceBudget Create(int budgetMs, int maxPerSlice, bool adaptive)
+        private SlicePhase _phase;
+        private long _hitchTicks;          // 0 disables hitch tracking
+        private HitchRecord[] _hitches;
+        private int _hitchesKept;
+        private int _hitchTotal;
+        private int _gen0Before, _gen1Before, _gen2Before;
+        private int _bufCapBefore, _entCapBefore, _visCapBefore;
+
+        public static SliceBudget Create(int budgetMs, int maxPerSlice, bool adaptive,
+                                         float headroom, int hitchMs)
         {
             // Double math on purpose: verify mode passes int.MaxValue, and float would round
             // the product into something meaningless.
             long ticks = (long)(Stopwatch.Frequency * (budgetMs / 1000.0));
             if (ticks < 1) ticks = 1;
 
-            return new SliceBudget
+            float capTarget = DetectTargetFrameMs();
+
+            var b = new SliceBudget
             {
                 _budgetTicks = ticks,
                 _maxPerSlice = maxPerSlice,
@@ -66,12 +115,33 @@ namespace AsyncSave.Snapshot
                 _blocks = 0,
                 _adaptive = adaptive,
                 _maxBudgetMs = budgetMs,
-                _targetFrameMs = DetectTargetFrameMs(),
+                _headroom = headroom,
+                _capTargetMs = capTarget,
+                _targetFrameMs = capTarget,
                 _baseFrameEmaMs = -1f,
                 _lastSliceMs = 0f,
+                _lastBudgetMs = budgetMs,
                 _ticksPerMs = Stopwatch.Frequency / 1000f,
+                _phase = SlicePhase.Presize,
+                _hitchTicks = 0,
+                _hitches = null,
+                _hitchesKept = 0,
+                _hitchTotal = 0,
             };
+
+            if (hitchMs > 0)
+            {
+                b._hitchTicks = (long)(Stopwatch.Frequency * (hitchMs / 1000.0));
+                if (b._hitchTicks < 1) b._hitchTicks = 1;
+                b._hitches = new HitchRecord[HitchSlots];
+                b.SampleBlockStart();
+            }
+
+            return b;
         }
+
+        /// Tag the blocks that follow. Recorded on every hitch so a spike names its phase.
+        public void SetPhase(SlicePhase phase) => _phase = phase;
 
         /// Count one processed object. Returns true when the current slice should end.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -91,6 +161,8 @@ namespace AsyncSave.Snapshot
             if (elapsed > _worstTicks) _worstTicks = elapsed;
             _lastSliceMs = elapsed / _ticksPerMs;
             ++_blocks;
+
+            if (_hitchTicks != 0 && elapsed >= _hitchTicks) RecordHitch(elapsed);
         }
 
         public void BeginSlice()
@@ -110,15 +182,28 @@ namespace AsyncSave.Snapshot
                     ? baseMs
                     : _baseFrameEmaMs + (baseMs - _baseFrameEmaMs) * Alpha;
 
-                float budgetMs = _targetFrameMs - _baseFrameEmaMs;
+                // The target is proportional to what a frame actually costs, not a flat 60 Hz.
+                // A flat target is only a throttle on a machine that is already near it: at a
+                // 4.3 ms base frame it authorises a 12.4 ms slice, i.e. a 4x frame-time
+                // increase, and the only thing that ever held that back was the config
+                // ceiling. Proportional keeps the cost felt-relative on every machine, and the
+                // detected cap stays as an upper bound so we never authorise dropping below
+                // the framerate the player asked for.
+                float target = _baseFrameEmaMs * (1f + _headroom);
+                if (target > _capTargetMs) target = _capTargetMs;
+                _targetFrameMs = target;
+
+                float budgetMs = target - _baseFrameEmaMs;
                 if (budgetMs > _maxBudgetMs) budgetMs = _maxBudgetMs;
                 if (budgetMs < MinBudgetMs) budgetMs = MinBudgetMs;
 
+                _lastBudgetMs = budgetMs;
                 _budgetTicks = (long)(budgetMs * _ticksPerMs);
                 if (_budgetTicks < 1) _budgetTicks = 1;
             }
 
             _inSlice = 0;
+            if (_hitchTicks != 0) SampleBlockStart();
             _sliceStart = Stopwatch.GetTimestamp();
         }
 
@@ -132,11 +217,94 @@ namespace AsyncSave.Snapshot
         /// Smoothed cost of a frame excluding our own slice. Diagnostic only.
         public float BaseFrameMs => _baseFrameEmaMs < 0f ? 0f : _baseFrameEmaMs;
 
-        /// Frame time the adaptive budget is aiming at. Diagnostic only.
+        /// Frame time the adaptive budget is currently aiming at. Diagnostic only.
         public float TargetFrameMs => _targetFrameMs;
 
+        /// The explicit fps cap / vsync interval the target is bounded by. Diagnostic only.
+        public float CapTargetMs => _capTargetMs;
+
+        /// Budget granted to the most recent slice. Diagnostic only.
+        public float LastBudgetMs => _lastBudgetMs;
+
+        /// How many blocks ran past the hitch threshold.
+        public int HitchCount => _hitchTotal;
+
+        /// One line per kept hitch, worst first. Empty when hitch tracking is off or clean.
+        public string FormatHitches()
+        {
+            if (_hitches == null || _hitchesKept == 0) return null;
+
+            var sb = new StringBuilder();
+            for (int i = 0; i < _hitchesKept; ++i)
+            {
+                var h = _hitches[i];
+                sb.Append("\n  ").Append(h.Ms.ToString("0.00")).Append("ms block#").Append(h.Block)
+                  .Append(' ').Append(h.Phase.ToString());
+
+                if (h.Gen0 != 0 || h.Gen1 != 0 || h.Gen2 != 0)
+                    sb.Append(" gc=").Append(h.Gen0).Append('/').Append(h.Gen1).Append('/').Append(h.Gen2);
+
+                if (h.BufferCapBefore != h.BufferCapAfter)
+                    sb.Append(" bufferGrew=").Append(h.BufferCapBefore).Append("->").Append(h.BufferCapAfter);
+                if (h.EntriesCapBefore != h.EntriesCapAfter)
+                    sb.Append(" entriesGrew=").Append(h.EntriesCapBefore).Append("->").Append(h.EntriesCapAfter);
+                if (h.VisitedCapBefore != h.VisitedCapAfter)
+                    sb.Append(" visitedGrew=").Append(h.VisitedCapBefore).Append("->").Append(h.VisitedCapAfter);
+
+                // Nothing grew and no collection ran: the block was our own work overrunning
+                // the budget, which points at Step() granularity or one very expensive element.
+                if (h.Gen0 == 0 && h.Gen1 == 0 && h.Gen2 == 0 &&
+                    h.BufferCapBefore == h.BufferCapAfter &&
+                    h.EntriesCapBefore == h.EntriesCapAfter &&
+                    h.VisitedCapBefore == h.VisitedCapAfter)
+                    sb.Append(" (no gc, no growth)");
+            }
+            return sb.ToString();
+        }
+
+        private void SampleBlockStart()
+        {
+            _gen0Before = GC.CollectionCount(0);
+            _gen1Before = GC.CollectionCount(1);
+            _gen2Before = GC.CollectionCount(2);
+            SnapshotState.CurrentCaps(out _bufCapBefore, out _entCapBefore, out _visCapBefore);
+        }
+
+        private void RecordHitch(long elapsed)
+        {
+            ++_hitchTotal;
+
+            var rec = new HitchRecord
+            {
+                Block = _blocks,
+                Phase = _phase,
+                Ms = elapsed / _ticksPerMs,
+                Gen0 = GC.CollectionCount(0) - _gen0Before,
+                Gen1 = GC.CollectionCount(1) - _gen1Before,
+                Gen2 = GC.CollectionCount(2) - _gen2Before,
+                BufferCapBefore = _bufCapBefore,
+                EntriesCapBefore = _entCapBefore,
+                VisitedCapBefore = _visCapBefore,
+            };
+            SnapshotState.CurrentCaps(out rec.BufferCapAfter, out rec.EntriesCapAfter, out rec.VisitedCapAfter);
+
+            // Keep the worst HitchSlots, sorted descending. A ring of the *first* N would fill
+            // up with the startup allocations and then never see the spike we are hunting.
+            if (_hitchesKept < HitchSlots) ++_hitchesKept;
+            else if (rec.Ms <= _hitches[HitchSlots - 1].Ms) return;
+
+            int i = _hitchesKept - 1;
+            while (i > 0 && _hitches[i - 1].Ms < rec.Ms)
+            {
+                _hitches[i] = _hitches[i - 1];
+                --i;
+            }
+            _hitches[i] = rec;
+        }
+
         /// The game's own FPS cap when it has one, otherwise the vsync interval,
-        /// otherwise 60 Hz.
+        /// otherwise 60 Hz. This is a ceiling on the target, not the target itself -
+        /// BeginSlice narrows it to something proportional to the measured frame cost.
         private static float DetectTargetFrameMs()
         {
             int fps = Application.targetFrameRate;

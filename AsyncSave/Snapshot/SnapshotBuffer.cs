@@ -22,6 +22,25 @@ namespace AsyncSave.Snapshot
 
         public void Reset() => Position = 0;
 
+        /// Size the buffer for a whole snapshot up front. Only valid while Position is 0: it
+        /// discards the old array rather than copying it, which is the entire point.
+        ///
+        /// Growing organically into a 250 MB world is six doublings that allocate half a
+        /// gigabyte and BlockCopy a quarter of one, every copy landing mid-slice where the
+        /// time budget cannot see it - the last of them moves 128 MB inside a single frame.
+        /// Same policy as VisitedSet.EnsureCapacity and SnapshotState.EnsureEntryCapacity;
+        /// EnsureFree stays as the backstop for an undercount.
+        public void EnsureCapacityDiscard(int bytes)
+        {
+            if (bytes <= Data.Length) return;
+            if (Position != 0) return;   // caller error; growing here would lose the tail
+
+            // Exactly the requested size, not the next power of two. The estimate already
+            // carries its own headroom, and rounding a 360 MB request up to 512 MB would make
+            // the presize allocate more than the doubling chain it exists to replace.
+            Data = new byte[bytes];
+        }
+
         /// Ensure at least `additional` bytes remain past Position.
         ///
         /// Callers must not rely on this preserving anything past Position: growth copies

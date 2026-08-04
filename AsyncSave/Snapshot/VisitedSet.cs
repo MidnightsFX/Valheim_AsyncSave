@@ -13,12 +13,17 @@ namespace AsyncSave.Snapshot
     ///
     /// Dedup is not optional: a ZDO that appears twice in the save file makes ZDOMan.Load call
     /// Dictionary.Add with a duplicate key, which throws and takes the whole world with it.
+    ///
+    /// Each slot also carries the index of the entry the uid was written to. That is what lets
+    /// dirty reconciliation find the record for a mutated ZDO without a second uid->index map:
+    /// the probe that already had to happen for dedup answers both questions.
     internal sealed class VisitedSet
     {
         private struct Slot
         {
             public uint Stamp;
             public ZDOID Key;
+            public int Index;
         }
 
         private Slot[] _slots;
@@ -75,8 +80,9 @@ namespace AsyncSave.Snapshot
             _stamp = 1;
         }
 
-        /// Returns true if the uid was not already present.
-        public bool Add(ZDOID uid)
+        /// Record that `uid` was serialized to entry `index`. Returns true if the uid was not
+        /// already present; false means it was a duplicate sighting and `index` is discarded.
+        public bool Add(ZDOID uid, int index)
         {
             uint stamp = _stamp;
             var slots = _slots;
@@ -87,6 +93,7 @@ namespace AsyncSave.Snapshot
                 {
                     slots[i].Stamp = stamp;
                     slots[i].Key = uid;
+                    slots[i].Index = index;
                     if (++_count >= _growAt) Grow();
                     return true;
                 }
@@ -94,6 +101,24 @@ namespace AsyncSave.Snapshot
                 i = (i + 1) & _mask;
             }
         }
+
+        /// Look up the entry index a uid was serialized to. False if it was never serialized -
+        /// which is the normal answer for a ZDO created after the walk passed its sector.
+        public bool TryGetIndex(ZDOID uid, out int index)
+        {
+            uint stamp = _stamp;
+            var slots = _slots;
+            int i = Hash(uid) & _mask;
+            while (true)
+            {
+                if (slots[i].Stamp != stamp) { index = -1; return false; }
+                if (slots[i].Key == uid) { index = slots[i].Index; return true; }
+                i = (i + 1) & _mask;
+            }
+        }
+
+        /// Backing slot count. Reported by the hitch log so a growth mid-slice is visible.
+        public int Capacity => _slots.Length;
 
         /// Same mix as ZdoIdComparer: ZDOID.GetHashCode indexes a static List&lt;long&gt; to turn
         /// UserKey back into a user id, which is a bounds check and a deref we do not need.
@@ -119,6 +144,7 @@ namespace AsyncSave.Snapshot
                 while (next[i].Stamp == stamp) i = (i + 1) & mask;
                 next[i].Stamp = stamp;
                 next[i].Key = key;
+                next[i].Index = old[j].Index;
             }
 
             _slots = next;

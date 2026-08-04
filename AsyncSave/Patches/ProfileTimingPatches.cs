@@ -50,7 +50,13 @@ namespace AsyncSave.Patches
         [HarmonyPatch(typeof(Game), nameof(Game.SavePlayerProfile))]
         internal static class GameSavePlayerProfile
         {
-            static void Prefix(out Stopwatch __state)
+            /// Priority.First plus __runOriginal, because SavePlayerProfilePatch prefixes the
+            /// same method and returns false on the async path. Harmony skips later prefixes
+            /// once one does that unless they opt in by taking __runOriginal - which is how
+            /// this reported "TOTAL 0 ms" on a frame where the capture alone measured 9 ms.
+            /// The parameter is unused; taking it is the opt-in.
+            [HarmonyPriority(Priority.First)]
+            static void Prefix(out Stopwatch __state, bool __runOriginal)
             {
                 __state = SASettings.PhaseTimings.Value ? Stopwatch.StartNew() : null;
             }
