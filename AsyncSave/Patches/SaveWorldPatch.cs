@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading.Tasks;
 using HarmonyLib;
+using AsyncSave.Profile;
 using AsyncSave.Snapshot;
 using AsyncSave.Util;
 using SASettings = AsyncSave.Config.Settings;
@@ -47,18 +48,29 @@ namespace AsyncSave.Patches
                 return true;
             }
 
-            if (sync)
+            if (sync && ProfileSave.ForceSync)
             {
-                // Sync save (shutdown / manual) mid-async - abort our coroutine, then
+                // Shutdown save mid-async - abort our coroutine, then
                 // reset TCS to completed-true so the vanilla SaveWorldThread runs.
-                SnapshotCoroutine.Abort("preempted by sync save");
+                SnapshotCoroutine.Abort("preempted by shutdown save");
                 var reset = new TaskCompletionSource<bool>();
                 reset.SetResult(true);
                 SnapshotState.Task = reset;
                 return true;
             }
 
-            // Async save already in progress - drop this duplicate.
+            // Command-invoked save (/save) arrives while async is in progress.
+            if (ShouldForceSync(sync))
+            {
+                // Sync command save mid-async - abort and let vanilla run synchronously.
+                SnapshotCoroutine.Abort("preempted by sync command save");
+                var reset = new TaskCompletionSource<bool>();
+                reset.SetResult(true);
+                SnapshotState.Task = reset;
+                return true;
+            }
+
+            // Autosave or async command save already in progress - drop this duplicate.
             Log.Debug("AsyncSave: dropping duplicate async save request.");
             return false;
         }
@@ -123,18 +135,34 @@ namespace AsyncSave.Patches
                 new CodeInstruction(OpCodes.Call, customStart) { labels = { doCustom } },
             });
 
+            MethodInfo shouldForceSync = AccessTools.DeclaredMethod(typeof(SaveWorldPatch), nameof(ShouldForceSync));
+
             // Head insert: at iZdo the ZDOMan receiver is already on the stack.
+            // ShouldForceSync(false) returns false (autosave, never forced).
+            // ShouldForceSync(true) checks ForceSync and config. If not forced, we want async.
             code.InsertRange(iZdo, new[]
             {
-                new CodeInstruction(OpCodes.Ldarg_1),            // sync
-                new CodeInstruction(OpCodes.Brfalse, doCustom),
+                new CodeInstruction(OpCodes.Ldarg_1),                    // sync
+                new CodeInstruction(OpCodes.Call, shouldForceSync),     // -> bool
+                new CodeInstruction(OpCodes.Brfalse, doCustom),         // !forced → async path
             });
 
             return code;
         }
 
-        // Called from transpiled ZNet.SaveWorld when !sync. Consumes the ZDOMan instance that
-        // was already pushed onto the stack (it would have been the receiver for PrepareSave).
+        /// Determine whether this save should take the synchronous vanilla path.
+        /// Autosaves are never forced. Shutdown saves are always forced. Command invokes
+        /// honour the AsyncCommandSave config switch. Called from both Prefix and transpiled IL.
+        public static bool ShouldForceSync(bool sync)
+        {
+            if (!sync) return false; // autosave -> never force
+            if (ProfileSave.ForceSync) return true; // shutdown -> force
+            return !SASettings.AsyncCommandSave.Value; // command -> honor config
+        }
+
+        // Called from transpiled ZNet.SaveWorld when the sync flag is not forcing vanilla path.
+        // Consumes the ZDOMan instance that was already pushed onto the stack
+        // (it would have been the receiver for PrepareSave).
         public static void AsyncSaveStart(ZDOMan zdoMan)
         {
             if (SASettings.WorldSaveEnabled.Value)

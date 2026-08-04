@@ -30,6 +30,7 @@ namespace AsyncSave.Config
 
         // 2 - World Save (server side; a client never runs the world save at all)
         public static ConfigEntry<bool> WorldSaveEnabled;
+        public static ConfigEntry<bool> AsyncCommandSave;
         public static ConfigEntry<int> SliceBudgetMs;
         public static ConfigEntry<bool> AdaptiveBudget;
         public static ConfigEntry<int> FrameHeadroomPercent;
@@ -66,6 +67,11 @@ namespace AsyncSave.Config
                 "Spread the world (ZDO) save across frames instead of stalling on it. " +
                 "Only ever runs on the server or a host - a pure client ignores this. " +
                 "Forced off automatically if the ZNet.SaveWorld patch fails to apply.");
+
+            AsyncCommandSave = cfg.Bind(
+                "2 - World Save", "Async command saves", true,
+                "Use the async save path for command-invoked saves (e.g. /save). " +
+                "Shutdown saves remain synchronous regardless of this setting, ensuring clean persistence on exit.");
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,
