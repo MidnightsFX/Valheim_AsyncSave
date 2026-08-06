@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Threading;
 using AsyncSave.Util;
 using SASettings = AsyncSave.Config.Settings;
+using SALogLevel = AsyncSave.Config.LogLevel;
 
 namespace AsyncSave.Profile
 {
@@ -124,21 +126,44 @@ namespace AsyncSave.Profile
 
         /// Block until any in-flight character save has fully landed on disk. Used on the
         /// must-complete paths, where the scene is about to be torn down.
+        ///
+        /// This sits directly on the quit path, so it is timed: a slow drain here is
+        /// indistinguishable from a hung game to whoever is looking at the window.
         public static void DrainToDisk()
         {
             if (!Active) { SaveIo.Drain(); return; }
 
+            var sw = Stopwatch.StartNew();
+            int guard = 0;
+
             // The pipeline needs a main-thread hop between the two worker stages, so step it
             // manually rather than waiting on the pump that is about to stop running.
-            for (int guard = 0; guard < 10000 && Active; ++guard)
+            for (; guard < 10000 && Active; ++guard)
             {
-                SaveIo.Drain();
+                // A failed drain means a worker job is wedged. Continuing would just spin the
+                // guard loop at one drain timeout per iteration.
+                if (!SaveIo.Drain()) break;
                 if (Stage == ProfileSaveStage.ReadyToBuild) BuildAndQueueWrite();
                 else if (Stage == ProfileSaveStage.Done) { Reset(); break; }
                 else if (!SaveIo.Busy && Stage == ProfileSaveStage.Writing) break;
             }
+
+            bool exhausted = guard >= 10000;
+            if (exhausted)
+            {
+                Log.Error($"AsyncSave: character save did not settle after {guard} drain rounds " +
+                          $"({sw.ElapsedMilliseconds} ms, stage {Stage}). Abandoning it so shutdown can " +
+                          "continue - the character file may be a save behind.");
+            }
+
             SaveIo.Drain();
             Reset();
+
+            if (!exhausted && SASettings.Logging.Value != SALogLevel.Off)
+            {
+                Log.Info($"AsyncSave: landed the in-flight character save in {sw.ElapsedMilliseconds} ms " +
+                         $"over {guard + 1} round(s) before shutdown.");
+            }
         }
     }
 }

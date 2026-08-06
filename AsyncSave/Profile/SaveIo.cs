@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using AsyncSave.Util;
+using SASettings = AsyncSave.Config.Settings;
+using SALogLevel = AsyncSave.Config.LogLevel;
 
 namespace AsyncSave.Profile
 {
@@ -66,15 +69,37 @@ namespace AsyncSave.Profile
             }
         }
 
+        /// Longest we will hold the main thread waiting for the worker. A character save is a
+        /// GZip and a SHA512 over a few megabytes plus one file write; anything past this is a
+        /// job that is not coming back, and spinning on it forever would hang the quit path
+        /// exactly the way it looks like a crash to the player.
+        private const int DrainTimeoutMs = 10000;
+
         /// Block the calling (main) thread until every queued job has finished. Used only on
         /// the must-complete paths - shutdown, quit to menu - where the scene is about to be
-        /// torn down underneath us.
-        public static void Drain()
+        /// torn down underneath us. Returns false if the timeout expired with work outstanding.
+        public static bool Drain()
         {
+            if (Volatile.Read(ref _pending) == 0) return true;
+
+            var sw = Stopwatch.StartNew();
             while (Volatile.Read(ref _pending) > 0)
             {
+                if (sw.ElapsedMilliseconds >= DrainTimeoutMs)
+                {
+                    Log.Error($"AsyncSave: character save worker did not finish within {DrainTimeoutMs} ms " +
+                              $"({Volatile.Read(ref _pending)} job(s) outstanding). Giving up rather than " +
+                              "hanging shutdown - the character file may be a save behind.");
+                    return false;
+                }
                 Thread.Sleep(1);
             }
+
+            if (SASettings.Logging.Value == SALogLevel.Detailed)
+            {
+                Log.Info($"AsyncSave: drained the character save worker in {sw.ElapsedMilliseconds} ms.");
+            }
+            return true;
         }
 
         private static void WorkerLoop()

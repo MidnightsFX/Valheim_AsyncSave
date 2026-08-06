@@ -70,8 +70,11 @@ namespace AsyncSave.Config
 
             AsyncCommandSave = cfg.Bind(
                 "2 - World Save", "Async command saves", true,
-                "Use the async save path for command-invoked saves (e.g. /save). " +
-                "Shutdown saves remain synchronous regardless of this setting, ensuring clean persistence on exit.");
+                "Use the async save path for the in-game menu's Save button (which vanilla only " +
+                "takes in single-player, or on a host with no connected players). The /save " +
+                "console command already runs asynchronously in vanilla and is unaffected either " +
+                "way. Turn this off to have the Save button block until the world is on disk. " +
+                "Shutdown, logout and quit always save synchronously regardless of this setting.");
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,

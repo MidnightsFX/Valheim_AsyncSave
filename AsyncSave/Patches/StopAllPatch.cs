@@ -17,6 +17,15 @@ namespace AsyncSave.Patches
             ProfileSave.DrainToDisk();
 
             if (!SnapshotState.InProgress && !SnapshotState.ReadyForWrite && !ZoneSnapshot.Ready) return;
+
+            // Vanilla StopAll joins the save thread unconditionally right after this
+            // (ZNet.cs:392), so whatever we start here has to be the vanilla sync path - an
+            // async save would leave that Join waiting on a writer parked on a coroutine the
+            // main thread can no longer run. ZNet.ShutdownWithoutSave (console suspend) reaches
+            // StopAll without going through Game.Shutdown, so the latch is not already set.
+            // Game.Awake clears it again if we come back to a world in the same process.
+            ProfileSave.ForceSync = true;
+
             // SaveWorld(true) will invoke our SaveWorldPatch.Prefix which aborts the
             // pending snapshot and re-runs vanilla PrepareSave/SaveAsync synchronously.
             __instance.SaveWorld(true);

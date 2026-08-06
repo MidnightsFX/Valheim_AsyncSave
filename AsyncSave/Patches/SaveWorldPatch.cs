@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading.Tasks;
@@ -7,12 +8,28 @@ using AsyncSave.Profile;
 using AsyncSave.Snapshot;
 using AsyncSave.Util;
 using SASettings = AsyncSave.Config.Settings;
+using SALogLevel = AsyncSave.Config.LogLevel;
 
 namespace AsyncSave.Patches
 {
+    /// Per-invocation timing state for ZNet.SaveWorld. A field would not do: StopAllPatch
+    /// calls SaveWorld from inside ZNet.StopAll, so two invocations can be live at once.
+    internal struct SaveWorldTiming
+    {
+        /// The original method body ran, i.e. the prefix returned true.
+        public bool Ran;
+        /// The sync flag as the caller passed it, before any downgrade.
+        public bool WasSync;
+        /// The sync flag the original body actually saw.
+        public bool Sync;
+        public long Start;
+    }
+
     /// Gate and re-route ZNet.SaveWorld:
-    ///  - if snapshot in progress and sync arrives: abort snapshot, reset TCS to
-    ///    completed-true so vanilla's fresh SaveWorldThread proceeds, then let vanilla run
+    ///  - if the save must complete (shutdown, or the manual save button with async manual
+    ///    saves turned off): let vanilla run untouched, aborting any snapshot first
+    ///  - if it need not complete but the caller asked for sync: downgrade the sync flag so
+    ///    vanilla skips its save-thread Join, then take the async branch
     ///  - if snapshot in progress and async arrives: drop the duplicate save
     ///  - otherwise: transpile the async path to skip all three PrepareSave calls and start
     ///    our coroutine, which performs the equivalent work itself
@@ -24,9 +41,39 @@ namespace AsyncSave.Patches
         /// stands down so we never half-apply.
         internal static bool TranspilerFailed;
 
-        static bool Prefix(ZNet __instance, bool sync)
+        /// Main-thread blocks shorter than this are only reported at Detailed. An async save
+        /// costs a fraction of a millisecond here; anything near this figure means the snapshot
+        /// branch did not get taken.
+        private const float MainThreadLogThresholdMs = 50f;
+
+        static bool Prefix(ZNet __instance, ref bool sync, out SaveWorldTiming __state)
         {
-            if (TranspilerFailed) return true;
+            __state = new SaveWorldTiming
+            {
+                Ran = false,
+                WasSync = sync,
+                Sync = sync,
+                Start = Stopwatch.GetTimestamp(),
+            };
+
+            if (TranspilerFailed)
+            {
+                __state.Ran = true;
+                return true;
+            }
+
+            // Vanilla's tail is `if (!sync) return; m_saveThread.Join();`. On the async path
+            // that writer thread is parked in SaveWorldThreadPatch waiting on a TCS only the
+            // main-thread snapshot coroutine can complete - and the main thread would be sitting
+            // in that very Join. A permanent deadlock, and the reason the manual save button
+            // froze the game. If we are taking the async branch, take vanilla's async tail with
+            // it. What still guarantees the bytes land is the shutdown side: ForceSync makes
+            // Game.Shutdown / OnApplicationQuit run the whole save the vanilla way, and
+            // StopAllPatch forces one for any snapshot that is still pending.
+            //
+            // Written through `ref` so the transpiled body reads the same value we decided on
+            // here - ShouldForceSync is called from both, and they must never disagree.
+            if (sync && !ShouldForceSync(sync)) sync = false;
 
             // ZNet.SaveWorld opens with `if (m_saveThread.IsAlive) m_saveThread.Join()` - an
             // unbounded main-thread block waiting on a background thread that is streaming a
@@ -35,9 +82,10 @@ namespace AsyncSave.Patches
             // and vanilla would happily freeze the game on it. An autosave has no deadline, so
             // drop it and let the writer finish - the next one lands on the normal interval.
             //
-            // The sync path deliberately falls through: a shutdown or manual save must
-            // complete, and joining the previous writer first is the correct thing to do.
-            if (!sync && __instance.m_saveThread != null && __instance.m_saveThread.IsAlive)
+            // Tested against wasSync, not the downgraded flag: a save the player asked for
+            // should wait out the previous writer rather than be silently dropped, and that
+            // wait is bounded by whatever is left of the write.
+            if (!__state.WasSync && __instance.m_saveThread != null && __instance.m_saveThread.IsAlive)
             {
                 Log.Info("AsyncSave: previous world save is still writing to disk - skipping this autosave.");
                 return false;
@@ -45,34 +93,63 @@ namespace AsyncSave.Patches
 
             if (SnapshotState.Task.Task.IsCompleted && !SnapshotState.InProgress)
             {
+                __state.Ran = true;
+                __state.Sync = sync;
                 return true;
             }
 
-            if (sync && ProfileSave.ForceSync)
-            {
-                // Shutdown save mid-async - abort our coroutine, then
-                // reset TCS to completed-true so the vanilla SaveWorldThread runs.
-                SnapshotCoroutine.Abort("preempted by shutdown save");
-                var reset = new TaskCompletionSource<bool>();
-                reset.SetResult(true);
-                SnapshotState.Task = reset;
-                return true;
-            }
-
-            // Command-invoked save (/save) arrives while async is in progress.
+            // A save that must complete arrives mid-snapshot. After the downgrade above,
+            // ShouldForceSync is true exactly when sync survived it, so shutdown saves and
+            // config-disabled manual saves share one branch: abort our coroutine, then reset
+            // the TCS to completed-true so the fresh vanilla SaveWorldThread proceeds.
             if (ShouldForceSync(sync))
             {
-                // Sync command save mid-async - abort and let vanilla run synchronously.
-                SnapshotCoroutine.Abort("preempted by sync command save");
+                SnapshotCoroutine.Abort(ProfileSave.ForceSync
+                    ? "preempted by shutdown save"
+                    : "preempted by sync manual save");
                 var reset = new TaskCompletionSource<bool>();
                 reset.SetResult(true);
                 SnapshotState.Task = reset;
+                __state.Ran = true;
+                __state.Sync = sync;
                 return true;
             }
 
-            // Autosave or async command save already in progress - drop this duplicate.
+            // Autosave or async manual save already in progress - drop this duplicate.
             Log.Debug("AsyncSave: dropping duplicate async save request.");
             return false;
+        }
+
+        /// Harmony runs postfixes even when a prefix skipped the original, hence the Ran flag.
+        ///
+        /// The interval measured here spans the whole of ZNet.SaveWorld, so on the sync path it
+        /// covers vanilla's three PrepareSave calls *and* the save-thread Join - exactly the
+        /// stretch the player experiences as a freeze.
+        static void Postfix(SaveWorldTiming __state)
+        {
+            if (!__state.Ran) return;
+
+            var log = SASettings.Logging.Value;
+            if (log == SALogLevel.Off) return;
+
+            float ms = (Stopwatch.GetTimestamp() - __state.Start) * 1000f / Stopwatch.Frequency;
+            bool notable = __state.WasSync || ms >= MainThreadLogThresholdMs;
+            if (log == SALogLevel.Simple && !notable) return;
+
+            if (__state.Sync)
+            {
+                Log.Info($"AsyncSave: ZNet.SaveWorld blocked the main thread for {ms:0.0} ms " +
+                         "(sync path: vanilla PrepareSave + save thread Join).");
+            }
+            else if (__state.WasSync)
+            {
+                Log.Info($"AsyncSave: ZNet.SaveWorld returned in {ms:0.0} ms " +
+                         "(manual save, downgraded to the async path - no Join).");
+            }
+            else
+            {
+                Log.Info($"AsyncSave: ZNet.SaveWorld returned in {ms:0.0} ms (async path).");
+            }
         }
 
         // Vanilla ZNet.SaveWorld runs three PrepareSave calls back to back:
@@ -151,8 +228,9 @@ namespace AsyncSave.Patches
         }
 
         /// Determine whether this save should take the synchronous vanilla path.
-        /// Autosaves are never forced. Shutdown saves are always forced. Command invokes
-        /// honour the AsyncCommandSave config switch. Called from both Prefix and transpiled IL.
+        /// Autosaves are never forced. Shutdown saves are always forced. The only other caller
+        /// that passes sync is Menu.OnManualSave, which honours the AsyncCommandSave config
+        /// switch. Called from both Prefix and transpiled IL, which must agree.
         public static bool ShouldForceSync(bool sync)
         {
             if (!sync) return false; // autosave -> never force

@@ -13,6 +13,21 @@ namespace AsyncSave.Patches
     [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.SaveAsync))]
     internal static class SaveAsyncPatch
     {
+        /// What the last write actually put on disk, for SaveWorldThreadPatch's summary line.
+        /// Written on the save thread and read by it, in that order, within one save.
+        /// SaveWorldThreadPatch clears these before the body runs so a save that fell through
+        /// to vanilla can never report the previous snapshot's figures.
+        internal static int LastKeptCount;
+        internal static int LastZdoBytes;
+        internal static bool LastWasSnapshot;
+
+        internal static void ResetWriteStats()
+        {
+            LastKeptCount = 0;
+            LastZdoBytes = 0;
+            LastWasSnapshot = false;
+        }
+
         static bool Prefix(BinaryWriter writer)
         {
             // The verify harness runs this method twice: once for us, once for vanilla.
@@ -54,12 +69,16 @@ namespace AsyncSave.Patches
             // mutated record in place.
             int runOffset = 0;
             int runLength = 0;
+            // Bytes actually handed to the writer. Not the same as Buffer.Position: that also
+            // counts records the delete skip-list drops, and the orphaned originals of any ZDO
+            // reconciliation had to re-append because the new encoding outgrew the old one.
+            int written = 0;
             for (int i = 0; i < entryCount; ++i)
             {
                 var e = entries[i];
                 if (removes.Count > 0 && removes.Contains(e.Uid))
                 {
-                    if (runLength > 0) { writer.Write(buf, runOffset, runLength); runLength = 0; }
+                    if (runLength > 0) { writer.Write(buf, runOffset, runLength); written += runLength; runLength = 0; }
                     continue;
                 }
 
@@ -69,12 +88,16 @@ namespace AsyncSave.Patches
                 }
                 else
                 {
-                    if (runLength > 0) writer.Write(buf, runOffset, runLength);
+                    if (runLength > 0) { writer.Write(buf, runOffset, runLength); written += runLength; }
                     runOffset = e.Offset;
                     runLength = e.Length;
                 }
             }
-            if (runLength > 0) writer.Write(buf, runOffset, runLength);
+            if (runLength > 0) { writer.Write(buf, runOffset, runLength); written += runLength; }
+
+            LastKeptCount = keptCount;
+            LastZdoBytes = written;
+            LastWasSnapshot = true;
 
             if (SASettings.Logging.Value == SALogLevel.Detailed)
             {
