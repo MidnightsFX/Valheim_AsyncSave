@@ -95,7 +95,7 @@ namespace AsyncSave.Profile
                 Thread.Sleep(1);
             }
 
-            if (SASettings.Logging.Value == SALogLevel.Detailed)
+            if (SASettings.Logging.Value >= SALogLevel.Detailed)
             {
                 Log.Info($"AsyncSave: drained the character save worker in {sw.ElapsedMilliseconds} ms.");
             }

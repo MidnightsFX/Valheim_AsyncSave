@@ -37,9 +37,6 @@ namespace AsyncSave.Profile
         /// Set while shutting down: the whole save runs vanilla and synchronous.
         public static bool ForceSync;
 
-        /// Cleared if the IL version guard fails - see ProfileFormat.
-        public static bool FormatSupported = true;
-
         public static PlayerProfile Profile;
         public static byte[] MapData;
         public static bool HadMapCapture;
@@ -52,8 +49,7 @@ namespace AsyncSave.Profile
 
         public static bool Active => Stage != ProfileSaveStage.Idle;
 
-        public static bool Enabled =>
-            SASettings.CharacterSaveEnabled.Value && FormatSupported && !ForceSync;
+        public static bool Enabled => SASettings.CharacterSaveOn && !ForceSync;
 
         public static void Reset()
         {

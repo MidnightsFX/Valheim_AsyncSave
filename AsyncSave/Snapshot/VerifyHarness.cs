@@ -1,3 +1,4 @@
+#if DEBUG
 using System.IO;
 using AsyncSave.Util;
 
@@ -60,7 +61,8 @@ namespace AsyncSave.Snapshot
                     Bypass = false;
                 }
 
-                Report(mine.GetBuffer(), (int)mine.Length, vanilla.GetBuffer(), (int)vanilla.Length);
+                ByteDiff.Report("world save", mine.GetBuffer(), (int)mine.Length,
+                                vanilla.GetBuffer(), (int)vanilla.Length);
             }
             catch (System.Exception ex)
             {
@@ -75,47 +77,6 @@ namespace AsyncSave.Snapshot
             }
         }
 
-        private static void Report(byte[] a, int aLen, byte[] b, int bLen)
-        {
-            int min = aLen < bLen ? aLen : bLen;
-            int diff = -1;
-            for (int i = 0; i < min; ++i)
-            {
-                if (a[i] != b[i]) { diff = i; break; }
-            }
-
-            if (diff < 0 && aLen == bLen)
-            {
-                Log.Info($"AsyncSave verify: IDENTICAL ({aLen} bytes).");
-                return;
-            }
-
-            if (diff < 0)
-            {
-                Log.Error($"AsyncSave verify: LENGTH MISMATCH - asyncsave={aLen} vanilla={bLen}, " +
-                          $"common prefix of {min} bytes matches.");
-                return;
-            }
-
-            Log.Error($"AsyncSave verify: FIRST DIFFERENCE at offset {diff} " +
-                      $"(asyncsave={aLen} bytes, vanilla={bLen} bytes)");
-            Log.Error($"  asyncsave: {Dump(a, aLen, diff)}");
-            Log.Error($"  vanilla:   {Dump(b, bLen, diff)}");
-        }
-
-        private static string Dump(byte[] buf, int len, int center)
-        {
-            int from = center - 32; if (from < 0) from = 0;
-            int to = center + 32; if (to > len) to = len;
-            var sb = new System.Text.StringBuilder((to - from) * 3 + 16);
-            for (int i = from; i < to; ++i)
-            {
-                if (i == center) sb.Append('[');
-                sb.Append(buf[i].ToString("x2"));
-                if (i == center) sb.Append(']');
-                sb.Append(' ');
-            }
-            return sb.ToString();
-        }
     }
 }
+#endif

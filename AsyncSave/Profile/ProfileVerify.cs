@@ -1,3 +1,4 @@
+#if DEBUG
 using System;
 using AsyncSave.Patches;
 using AsyncSave.Util;
@@ -43,7 +44,7 @@ namespace AsyncSave.Profile
                 }
                 pkg.Write(ZNet.instance.IsReferencePositionPublic());
 
-                Report("map payload", ours, pkg.GetArray());
+                ByteDiff.Report("map payload", ours, pkg.GetArray());
             }
             catch (Exception ex)
             {
@@ -75,7 +76,7 @@ namespace AsyncSave.Profile
 
                 byte[] vanilla = VanillaPackage(profile);
 
-                Report(".fch package", ours, vanilla);
+                ByteDiff.Report(".fch package", ours, vanilla);
             }
             catch (Exception ex)
             {
@@ -143,47 +144,6 @@ namespace AsyncSave.Profile
             foreach (var kv in map) { pkg.Write(kv.Key); pkg.Write(kv.Value); }
         }
 
-        private static void Report(string what, byte[] ours, byte[] vanilla)
-        {
-            int min = ours.Length < vanilla.Length ? ours.Length : vanilla.Length;
-            int diff = -1;
-            for (int i = 0; i < min; ++i)
-            {
-                if (ours[i] != vanilla[i]) { diff = i; break; }
-            }
-
-            if (diff < 0 && ours.Length == vanilla.Length)
-            {
-                Log.Info($"AsyncSave verify: {what} IDENTICAL ({ours.Length} bytes).");
-                return;
-            }
-
-            if (diff < 0)
-            {
-                Log.Error($"AsyncSave verify: {what} LENGTH MISMATCH - asyncsave={ours.Length} vanilla={vanilla.Length}, " +
-                          $"common prefix of {min} bytes matches.");
-                return;
-            }
-
-            Log.Error($"AsyncSave verify: {what} FIRST DIFFERENCE at offset {diff} " +
-                      $"(asyncsave={ours.Length} bytes, vanilla={vanilla.Length} bytes)");
-            Log.Error($"  asyncsave: {Dump(ours, diff)}");
-            Log.Error($"  vanilla:   {Dump(vanilla, diff)}");
-        }
-
-        private static string Dump(byte[] buf, int center)
-        {
-            int from = center - 32; if (from < 0) from = 0;
-            int to = center + 32; if (to > buf.Length) to = buf.Length;
-            var sb = new System.Text.StringBuilder((to - from) * 3 + 16);
-            for (int i = from; i < to; ++i)
-            {
-                if (i == center) sb.Append('[');
-                sb.Append(buf[i].ToString("x2"));
-                if (i == center) sb.Append(']');
-                sb.Append(' ');
-            }
-            return sb.ToString();
-        }
     }
 }
+#endif

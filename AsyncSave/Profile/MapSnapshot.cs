@@ -30,8 +30,6 @@ namespace AsyncSave.Profile
         /// instead of throw), and pin names are player-supplied text.
         private static readonly System.Text.UTF8Encoding PinEncoding = new System.Text.UTF8Encoding(false, true);
 
-        private static int _mapVersion;
-
         /// True when Capture produced a payload that has not yet been consumed.
         public static bool HasCapture { get; private set; }
 
@@ -45,8 +43,6 @@ namespace AsyncSave.Profile
         /// Minimap.GetMapData's inner ZPackage would.
         public static void Capture(Minimap map)
         {
-            _mapVersion = Minimap.MAPVERSION;
-
             // Vanilla bounds BOTH loops by m_explored.Length. The arrays are allocated to the
             // same size in Minimap.Start, but mirror the original exactly.
             int n = map.m_explored.Length;
@@ -118,12 +114,13 @@ namespace AsyncSave.Profile
             }
 
             var result = new byte[8 + compressed.Length];
-            WriteInt(result, 0, _mapVersion);
+            WriteInt(result, 0, Minimap.MAPVERSION);
             WriteInt(result, 4, compressed.Length);
             System.Buffer.BlockCopy(compressed, 0, result, 8, compressed.Length);
             return result;
         }
 
+#if DEBUG
         /// Uncompressed payload, for the verify harness only.
         public static byte[] DebugPayloadCopy()
         {
@@ -131,6 +128,7 @@ namespace AsyncSave.Profile
             System.Buffer.BlockCopy(_payload, 0, copy, 0, _payloadLength);
             return copy;
         }
+#endif
 
         private static void WriteInt(byte[] buf, int offset, int value)
         {

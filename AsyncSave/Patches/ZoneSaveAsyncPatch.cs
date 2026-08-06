@@ -15,7 +15,9 @@ namespace AsyncSave.Patches
     {
         static bool Prefix(ZoneSystem __instance, BinaryWriter writer)
         {
+#if DEBUG
             if (VerifyHarness.Bypass) return true;
+#endif
 
             if (!ZoneSnapshot.Ready)
             {

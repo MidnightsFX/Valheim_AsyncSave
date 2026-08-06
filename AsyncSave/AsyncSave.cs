@@ -5,7 +5,6 @@ using AsyncSave.Patches;
 using AsyncSave.Profile;
 using AsyncSave.Util;
 using SASettings = AsyncSave.Config.Settings;
-using SAReconcile = AsyncSave.Config.ReconcileMode;
 
 namespace AsyncSave
 {
@@ -15,7 +14,7 @@ namespace AsyncSave
     {
         public const string ModGuid = "MidnightsFX.AsyncSave";
         public const string ModName = "AsyncSave";
-        public const string ModVersion = "0.2.0";
+        public const string ModVersion = "0.3.0";
 
         private Harmony _harmony;
 
@@ -29,8 +28,8 @@ namespace AsyncSave
             // Valheim target is big-endian, but refuse rather than corrupt saves if that changes.
             if (!System.BitConverter.IsLittleEndian)
             {
-                SASettings.WorldSaveEnabled.Value = false;
-                SASettings.CharacterSaveEnabled.Value = false;
+                SASettings.BlockWorldSave();
+                SASettings.BlockCharacterSave();
                 Log.Error("AsyncSave: big-endian runtime detected. Async save disabled - the " +
                           "snapshot serializer would produce an unloadable world file.");
             }
@@ -44,7 +43,7 @@ namespace AsyncSave
             // The character save is hand-written against a specific .fch layout. If the game
             // updated underneath us, stand that half down rather than write a format we do not
             // understand.
-            ProfileSave.FormatSupported = ProfileFormat.Verify();
+            if (!ProfileFormat.Verify()) SASettings.BlockCharacterSave();
 
             SaveIo.Start();
 
@@ -77,11 +76,7 @@ namespace AsyncSave
 
             if (missing == null) return;
 
-            var mode = SASettings.DeltaReconciliation.Value;
-            if (mode == SAReconcile.Dirty || mode == SAReconcile.Verify)
-            {
-                SASettings.DeltaReconciliation.Value = SAReconcile.FullScan;
-            }
+            SASettings.ForceFullScanReconcile();
 
             Log.Error($"AsyncSave: the ZDO revision hook on {missing} is not attached. Dirty " +
                       $"reconciliation cannot see mid-snapshot mutations without it and would " +

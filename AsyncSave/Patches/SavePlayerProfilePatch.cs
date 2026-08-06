@@ -37,7 +37,7 @@ namespace AsyncSave.Patches
                 return false;
             }
 
-            var stopwatch = SASettings.PhaseTimings.Value ? System.Diagnostics.Stopwatch.StartNew() : null;
+            var stopwatch = SASettings.LogTimings ? System.Diagnostics.Stopwatch.StartNew() : null;
 
             __instance.m_saveTimer = 0f;
 
@@ -53,7 +53,9 @@ namespace AsyncSave.Patches
                 {
                     MapSnapshot.Capture(map);
                     captured = true;
+#if DEBUG
                     if (SASettings.VerifyBytes.Value) ProfileVerify.CompareMapPayload(map);
+#endif
                 }
 
                 if (setLogoutPoint) profile.SaveLogoutPoint();
@@ -89,7 +91,7 @@ namespace AsyncSave.Patches
                     // pipeline wedges and no further character save ever runs.
                     try
                     {
-                        var sw = SASettings.PhaseTimings.Value ? System.Diagnostics.Stopwatch.StartNew() : null;
+                        var sw = SASettings.LogTimings ? System.Diagnostics.Stopwatch.StartNew() : null;
                         ProfileSave.MapData = MapSnapshot.Compress();
                         if (sw != null)
                             Log.Info($"AsyncSave timing: map compress (worker) {sw.ElapsedMilliseconds} ms, {ProfileSave.MapData.Length} bytes");

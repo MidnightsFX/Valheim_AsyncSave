@@ -7,19 +7,19 @@ namespace AsyncSave.Config
         Off,
         Simple,
         Detailed,
+        /// Detailed plus per-phase millisecond timings on both the main thread and the save
+        /// worker. Diagnostic; noisy.
+        Debug,
     }
 
     /// How mutations that land during snapshot yields are re-serialized.
     internal enum ReconcileMode
     {
-        /// No reconciliation. Mutations mid-snapshot are saved one revision stale.
-        Off,
         /// Re-serialize only the ZDOs our revision hooks flagged. O(mutations).
         Dirty,
-        /// Re-scan every entry against live DataRevision. O(world) - the pre-0.3 behaviour.
+        /// Re-scan every entry against live DataRevision. O(world), and correct regardless of
+        /// hook coverage.
         FullScan,
-        /// Dirty pass, then a full scan that reports anything the hooks missed. Diagnostic.
-        Verify,
     }
 
     internal static class Settings
@@ -30,34 +30,70 @@ namespace AsyncSave.Config
 
         // 2 - World Save (server side; a client never runs the world save at all)
         public static ConfigEntry<bool> WorldSaveEnabled;
-        public static ConfigEntry<bool> AsyncCommandSave;
+        public static ConfigEntry<bool> AsyncManualSave;
         public static ConfigEntry<int> SliceBudgetMs;
         public static ConfigEntry<bool> AdaptiveBudget;
         public static ConfigEntry<int> FrameHeadroomPercent;
-        public static ConfigEntry<int> MaxZdosPerSlice;
         public static ConfigEntry<ReconcileMode> DeltaReconciliation;
 
         // 3 - Character Save (client side; also covers the server's own Developer.fch)
         public static ConfigEntry<bool> CharacterSaveEnabled;
 
-        // 4 - Debug
-        public static ConfigEntry<bool> PhaseTimings;
-        public static ConfigEntry<int> HitchThresholdMs;
+#if DEBUG
+        // 4 - Debug. Debug builds only: the verify harnesses serialize everything twice and are
+        // for validating changes to the serializers, not for playing with.
         public static ConfigEntry<bool> VerifyBytes;
+#endif
+
+        /// Vanilla's Game.m_saveInterval initialiser. Used to tell "the player chose 1800" apart
+        /// from "the player left it alone", so we only take the setting over when they meant it.
+        private const int VanillaSaveInterval = 1800;
+
+        // Runtime stand-downs, latched at startup when something makes a half of the mod unsafe
+        // to run: a big-endian host, a failed transpile, an unrecognised .fch layout, a missing
+        // revision hook.
+        //
+        // Deliberately not written back to the ConfigEntry. BepInEx persists Value assignments to
+        // the .cfg, so doing that would let a one-off - a game update that renames a method, say -
+        // silently and permanently rewrite a setting the player chose. Fixing the mod afterwards
+        // would not put it back, and nothing ever told them it had changed. These flags live for
+        // the process and the file on disk keeps saying what the player asked for.
+        private static bool _worldSaveBlocked;
+        private static bool _characterSaveBlocked;
+        private static bool _reconcileForcedFullScan;
+
+        public static void BlockWorldSave() => _worldSaveBlocked = true;
+        public static void BlockCharacterSave() => _characterSaveBlocked = true;
+        public static void ForceFullScanReconcile() => _reconcileForcedFullScan = true;
+
+        /// Whether to slice the world save. Read this, never WorldSaveEnabled.Value.
+        public static bool WorldSaveOn => WorldSaveEnabled.Value && !_worldSaveBlocked;
+
+        /// Whether to run the async character save. Read this, never CharacterSaveEnabled.Value.
+        public static bool CharacterSaveOn => CharacterSaveEnabled.Value && !_characterSaveBlocked;
+
+        /// Effective reconciliation mode. Falls back to FullScan when the revision hooks are not
+        /// attached, since that mode depends on nothing but DataRevision itself.
+        public static ReconcileMode Reconcile =>
+            _reconcileForcedFullScan ? ReconcileMode.FullScan : DeltaReconciliation.Value;
+
+        /// True at Debug and above. Gates the per-phase timing lines.
+        public static bool LogTimings => Logging.Value >= LogLevel.Debug;
 
         public static void Bind(ConfigFile cfg)
         {
             SaveIntervalSeconds = cfg.Bind(
-                "1 - General", "Save interval (seconds)", 1800,
+                "1 - General", "Save interval (seconds)", VanillaSaveInterval,
                 new ConfigDescription(
                     "How often the world auto-saves, in seconds. Vanilla default is 1800 (30 minutes). " +
                     "Values below 60 disable the pre-save warning message but the save itself still works. " +
-                    "Applied immediately - no restart required.",
+                    "Applied immediately - no restart required. Left at 1800 this does not touch the " +
+                    "interval at all, so another mod setting it still wins.",
                     new AcceptableValueRange<int>(10, 86400)));
 
             Logging = cfg.Bind(
                 "1 - General", "Logging", LogLevel.Simple,
-                "Amount of information written to the log per save.");
+                "Amount of information written to the log per save. Debug adds per-phase timings.");
 
             // The two halves are independent on purpose: this DLL is meant to run unmodified on
             // a dedicated server, on a client, or on a host. Neither half syncs anything over
@@ -66,21 +102,25 @@ namespace AsyncSave.Config
                 "2 - World Save", "Enabled", true,
                 "Spread the world (ZDO) save across frames instead of stalling on it. " +
                 "Only ever runs on the server or a host - a pure client ignores this. " +
-                "Forced off automatically if the ZNet.SaveWorld patch fails to apply.");
+                "Turning this off restores the vanilla save path completely. The mod also stands " +
+                "this down by itself, for the session only, if it cannot patch ZNet.SaveWorld or " +
+                "the host is big-endian - this setting is never rewritten on disk.");
 
-            AsyncCommandSave = cfg.Bind(
-                "2 - World Save", "Async command saves", true,
+            AsyncManualSave = cfg.Bind(
+                "2 - World Save", "Async manual saves", true,
                 "Use the async save path for the in-game menu's Save button (which vanilla only " +
-                "takes in single-player, or on a host with no connected players). The /save " +
-                "console command already runs asynchronously in vanilla and is unaffected either " +
-                "way. Turn this off to have the Save button block until the world is on disk. " +
-                "Shutdown, logout and quit always save synchronously regardless of this setting.");
+                "takes in single-player, or on a host with no connected players). Turn this off to " +
+                "have the Save button block until the world is on disk. The /save console command " +
+                "is already asynchronous in vanilla and is unaffected either way. Shutdown, logout " +
+                "and quit always save synchronously regardless of this setting.");
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,
-                "Upper bound on the main-thread time budget per snapshot slice. Lower = smoother " +
-                "frames, longer total snapshot time. With the adaptive budget on this is a ceiling, " +
-                "not a target - a slice only ever gets whatever the frame had left over.");
+                new ConfigDescription(
+                    "Upper bound on the main-thread time budget per snapshot slice. Lower = smoother " +
+                    "frames, longer total snapshot time. With the adaptive budget on this is a ceiling, " +
+                    "not a target - a slice only ever gets whatever the frame had left over.",
+                    new AcceptableValueRange<int>(1, 33)));
 
             AdaptiveBudget = cfg.Bind(
                 "2 - World Save", "Adaptive budget", true,
@@ -100,57 +140,43 @@ namespace AsyncSave.Config
                     "Lower = smoother but longer saves. Ignored when the adaptive budget is off.",
                     new AcceptableValueRange<int>(5, 200)));
 
-            MaxZdosPerSlice = cfg.Bind(
-                "2 - World Save", "Max ZDOs per slice", 50000,
-                "Safety valve: hard cap on ZDOs examined per slice, regardless of the time budget. " +
-                "Only meant to bound a slice if the clock misbehaves. Setting this low enough to " +
-                "trip before the time budget (a ZDO costs a few hundred nanoseconds) just wastes " +
-                "budget and stretches the save out.");
-
             DeltaReconciliation = cfg.Bind(
                 "2 - World Save", "Reconcile mutations", ReconcileMode.Dirty,
                 "Re-serialize any ZDO whose DataRevision changed during snapshot yields, so a save is " +
                 "not one revision stale for mutations that land mid-snapshot. " +
                 "Dirty re-serializes only what the revision hooks flagged and costs nothing on an idle " +
                 "world. FullScan re-checks every ZDO against live state - correct regardless of hook " +
-                "coverage, but it walks the whole world every save. Verify runs both and logs anything " +
-                "Dirty missed; use it to validate the hooks, not in normal play. Off skips the pass.");
+                "coverage, but it walks the whole world every save. The mod switches to FullScan by " +
+                "itself, for the session only, if the revision hooks are not attached.");
 
             CharacterSaveEnabled = cfg.Bind(
                 "3 - Character Save", "Enabled", true,
                 "Move the character (.fch) save off the main thread: bulk-copy the minimap instead of " +
                 "writing 8 million bools one at a time, then compress, hash and write on a worker. " +
                 "Runs wherever there is a local player, and also covers a dedicated server's own " +
-                "profile write. Forced off automatically if the save format does not match what this " +
-                "build supports. Quitting always uses the untouched vanilla path.");
+                "profile write. Quitting always uses the untouched vanilla path. The mod stands " +
+                "this down by itself, for the session only, if the .fch layout is not the one this " +
+                "build was written against - this setting is never rewritten on disk.");
 
-            PhaseTimings = cfg.Bind(
-                "4 - Debug", "Log phase timings", false,
-                "Log per-phase millisecond timings for each save, on both the main thread and the " +
-                "save worker. Diagnostic only.");
-
-            HitchThresholdMs = cfg.Bind(
-                "4 - Debug", "Hitch threshold (ms)", 16,
-                new ConfigDescription(
-                    "With phase timings on, record every main-thread block that ran longer than this " +
-                    "and report the worst of them at the end of the save, with the phase it was in and " +
-                    "whether a GC or a pool growth happened inside it. The single worst-block number on " +
-                    "its own cannot tell one big stall apart from fifty medium ones.",
-                    new AcceptableValueRange<int>(1, 10000)));
-
+#if DEBUG
             VerifyBytes = cfg.Bind(
                 "4 - Debug", "Verify save bytes", false,
                 "Serialize the world and character saves both our way and vanilla's, then compare the " +
                 "two byte streams and log the first difference. Very expensive and it stutters the " +
                 "game - for validating changes to the serializers only.");
+#endif
 
             // Push the interval into Game.m_saveInterval on bind and on any live change.
             ApplySaveInterval();
             SaveIntervalSeconds.SettingChanged += (_, __) => ApplySaveInterval();
         }
 
+        /// Only when the player actually changed it. Writing the vanilla value back on every
+        /// startup would silently win a race with any other mod that sets the interval, for a
+        /// setting the player never touched.
         private static void ApplySaveInterval()
         {
+            if (SaveIntervalSeconds.Value == VanillaSaveInterval) return;
             Game.m_saveInterval = SaveIntervalSeconds.Value;
         }
     }

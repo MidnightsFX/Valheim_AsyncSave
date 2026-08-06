@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -13,16 +14,16 @@ namespace AsyncSave.Snapshot
     {
         private static Coroutine _current;
 
-        /// Main-thread cost of the reset, measured on the frame that triggers the save.
-        /// Everything here runs inside ZNet.SaveWorld, before the coroutine's first resume,
-        /// so it is outside every stopwatch in Run - which is exactly how ~230 MB of
-        /// collection memsets stayed invisible for as long as it did.
+        /// Main-thread cost of the reset, measured on the frame that triggers the save. It runs
+        /// inside ZNet.SaveWorld, before the coroutine's first resume, so it falls outside every
+        /// stopwatch in Run - which is how ~230 MB of collection memsets stayed invisible.
         private static float _triggerFrameMs;
 
-        /// Rounds of dirty reconciliation before we give up and let the stragglers be one
-        /// revision stale. Each round only sees mutations that landed during the previous
-        /// one, so on anything short of a pathologically busy server this converges in two.
-        private const int MaxDirtyRounds = 4;
+        /// Rounds the reconcile and adds passes will chase work that arrived while they ran,
+        /// before giving up on the stragglers. Each round only sees what landed during the
+        /// previous one, so on anything short of a pathologically busy server this converges
+        /// in two.
+        private const int MaxCatchUpRounds = 4;
 
         /// Start a new snapshot. Returns the Task that SaveWorldThread should wait on.
         public static Task<bool> Start(ZDOMan zdoMan)
@@ -35,10 +36,58 @@ namespace AsyncSave.Snapshot
             SnapshotState.SessionID = zdoMan.m_sessionID;
             SnapshotState.InProgress = true;
 
-            _current = ZNet.instance.StartCoroutine(Run(zdoMan, tcs));
+            _current = ZNet.instance.StartCoroutine(Guarded(Run(zdoMan, tcs), tcs));
 
             _triggerFrameMs = (Stopwatch.GetTimestamp() - t0) * 1000f / Stopwatch.Frequency;
             return tcs.Task;
+        }
+
+        /// Runs the walk so that it fails closed.
+        ///
+        /// ZNet.SaveWorldThread is a *foreground* thread (ZNet.cs:1203) parked on our completion
+        /// source with no deadline - deliberately, because a legitimate snapshot on a very large
+        /// world takes minutes and any wall-clock timeout would abandon the healthy saves that
+        /// need this mod most. That makes it our job never to leave the source uncompleted. If we
+        /// did, the writer would park forever, the process could not exit, InProgress would stay
+        /// set so every later save was dropped as a duplicate, and shutdown would deadlock on
+        /// ZNet.StopAll's Join - all from one unhandled exception anywhere in the walk.
+        ///
+        /// yield return cannot sit inside try/catch, but it is legal inside try/finally, and an
+        /// exception thrown in the walk unwinds through this finally on its way out of MoveNext,
+        /// before Unity's coroutine runner ever sees it. Iterator disposal - Unity tearing the
+        /// coroutine down because ZNet's GameObject went away - lands here too.
+        private static IEnumerator Guarded(IEnumerator walk, TaskCompletionSource<bool> tcs)
+        {
+            bool completed = false;
+            try
+            {
+                while (walk.MoveNext()) yield return walk.Current;
+                completed = true;
+            }
+            finally
+            {
+                // Guarded on still being the live snapshot. Unity does not promise to dispose a
+                // stopped iterator promptly, and a disposal that arrived after the next snapshot
+                // had started would otherwise reach in and clear its InProgress flag mid-walk.
+                if (!completed && ReferenceEquals(SnapshotState.Task, tcs))
+                {
+                    SnapshotState.InProgress = false;
+                    SnapshotState.ReadyForWrite = false;
+                    ZoneSnapshot.Reset();
+                    _current = null;
+
+                    // False means Abort already completed it - a deliberate stop, which logs its
+                    // own reason. True means we are the first to know, so nobody else will report
+                    // it. Releasing the writer with false makes it skip the vanilla body: this
+                    // save is lost, the next one starts from a clean snapshot.
+                    if (tcs.TrySetResult(false))
+                    {
+                        Log.Error("AsyncSave: the snapshot coroutine did not finish, so this world " +
+                                  "save was skipped. Look for the exception logged just above. The " +
+                                  "next save starts from a clean snapshot.");
+                    }
+                }
+            }
         }
 
         /// Abort the running snapshot (called by sync-save fallback).
@@ -48,13 +97,18 @@ namespace AsyncSave.Snapshot
             SnapshotState.InProgress = false;
             SnapshotState.ReadyForWrite = false;
             ZoneSnapshot.Reset();
+
+            // Completed before StopCoroutine, not after: it releases the parked writer a moment
+            // sooner, and it means Guarded's finally sees an already-completed source and stays
+            // quiet whether or not Unity disposes the iterator on our way out.
+            var tcs = SnapshotState.Task;
+            if (!tcs.Task.IsCompleted) tcs.TrySetResult(false);
+
             if (_current != null)
             {
                 ZNet.instance.StopCoroutine(_current);
                 _current = null;
             }
-            var tcs = SnapshotState.Task;
-            if (!tcs.Task.IsCompleted) tcs.TrySetResult(false);
             Log.Info($"AsyncSave snapshot aborted: {reason}");
         }
 
@@ -65,42 +119,36 @@ namespace AsyncSave.Snapshot
             yield return null;
 
             var log = SASettings.Logging.Value;
-            bool phaseTimings = SASettings.PhaseTimings.Value;
+            bool timings = SASettings.LogTimings;
             var totalStopwatch = Stopwatch.StartNew();
 
-            // GetUniqueHash mixes in ZDOExtraData.s_uniqueHashes, which increments per call
-            // and is never reset, so regenerating twice yields different connection hashes.
-            // The verify harness has to rewind it before running vanilla's pass.
+            // Byte-identity is only a well-defined property when nothing can mutate mid-walk, so
+            // the verify harness forces the whole snapshot into one un-yielded slice: no yields
+            // means no creates, destroys, mutations or sector migrations, and our entry order is
+            // exactly ZDOMan.GetSaveClone order. It stutters hard on purpose.
+            //
+            // Not a const in Release, so the branches below stay live-but-false rather than
+            // unreachable. The JIT folds them away; the compiler would only warn about them.
+#if DEBUG
+            // GetUniqueHash mixes in ZDOExtraData.s_uniqueHashes, which increments per call and is
+            // never reset, so regenerating twice yields different connection hashes. The harness
+            // has to rewind it before running vanilla's pass.
             bool verify = SASettings.VerifyBytes.Value;
             int savedUniqueHashes = verify ? ZDOExtraData.s_uniqueHashes : 0;
+#else
+            bool verify = false;
+#endif
 
             int budgetMs = SASettings.SliceBudgetMs.Value;
-            int maxPerSlice = SASettings.MaxZdosPerSlice.Value;
             bool adaptive = SASettings.AdaptiveBudget.Value;
             float headroom = SASettings.FrameHeadroomPercent.Value / 100f;
-            int hitchMs = phaseTimings ? SASettings.HitchThresholdMs.Value : 0;
-            var reconMode = SASettings.DeltaReconciliation.Value;
-            if (budgetMs < 1) budgetMs = 1;
-            if (maxPerSlice < 16) maxPerSlice = 16;
-
-            if (verify)
-            {
-                // Byte-identity is only a well-defined property when nothing can mutate
-                // mid-walk. Force the whole snapshot into one un-yielded slice: no yields
-                // means no creates, destroys, mutations or sector migrations, so our entry
-                // order is exactly ZDOMan.GetSaveClone order. This stutters hard on purpose,
-                // and the adaptive budget has to stand down or it would slice anyway.
-                budgetMs = int.MaxValue;
-                maxPerSlice = int.MaxValue;
-                adaptive = false;
-            }
+            var reconMode = SASettings.Reconcile;
 
             // Created before the connection-hash rebuild rather than after, so the worst-block
             // figure covers every millisecond this coroutine holds the main thread - the rebuild
             // shares a frame with the first slice, and a metric that excludes it would understate
             // what the player actually feels.
-            var slice = SliceBudget.Create(budgetMs, maxPerSlice, adaptive, headroom, hitchMs);
-            slice.SetPhase(SlicePhase.Presize);
+            var slice = SliceBudget.Create(budgetMs, adaptive, headroom, verify);
 
             // Rebuild connection hash data from live connections. O(connections), unsliced:
             // it has to be atomic with respect to live connections.
@@ -113,10 +161,9 @@ namespace AsyncSave.Snapshot
             // allocation instead of growing into it. Doing this here rather than in
             // ResetForNewSnapshot keeps the allocation off the frame that triggers the save.
             //
-            // A frame between them, because together they are several hundred megabytes of
-            // fresh LOH on a large world and one block holding all of it is exactly the kind
-            // of spike the slice budget cannot see. Verify mode keeps its single un-yielded
-            // slice - see above.
+            // A frame between them, because together they are gigabytes of fresh LOH on a large
+            // world and one block holding all of it is exactly the kind of spike the slice budget
+            // cannot see. Verify mode keeps its single un-yielded slice - see above.
             int expectedZdos = zdoMan.m_objectsByID.Count;
 
             SnapshotState.Visited.EnsureCapacity(expectedZdos);
@@ -125,12 +172,10 @@ namespace AsyncSave.Snapshot
             SnapshotState.EnsureEntryCapacity(expectedZdos);
             if (!verify) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
 
-            // The buffer used to be the one pool that still grew by doubling, six times over,
-            // allocating half a gigabyte and copying a quarter of one - all of it mid-slice,
-            // where the budget cannot interrupt it.
-            long wantBytes = (long)(expectedZdos * SnapshotState.BytesPerZdoEma * 1.15f);
-            if (wantBytes > int.MaxValue - 64) wantBytes = int.MaxValue - 64;
-            SnapshotState.Buffer.EnsureCapacityDiscard((int)wantBytes);
+            // 15% over the measured density, so the walk normally never has to add a block. double
+            // rather than float: at 48 M ZDOs the product is past where float keeps whole numbers.
+            long wantBytes = (long)(expectedZdos * (double)SnapshotState.BytesPerZdoEma * 1.15);
+            SnapshotState.Buffer.EnsureCapacity(wantBytes);
             if (!verify) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
 
             long presizeMs = totalStopwatch.ElapsedMilliseconds - connMs;
@@ -139,10 +184,12 @@ namespace AsyncSave.Snapshot
             // scratch list atomically (no yield during the copy), then yield freely while
             // iterating the stable scratch. This is what protects us from the "ZDO removed
             // mid-yield shifts sector indices and we skip an element" data-loss bug.
-            // Dedup is via SnapshotState.Visited - a ZDO that migrates sectors during a
-            // yield may appear in both the old sector's scratch (already processed) and the
-            // new sector's scratch (about to process); Visited.Add drops the duplicate.
-            slice.SetPhase(SlicePhase.SectorWalk);
+            //
+            // Sector migration during a yield cuts both ways, and the two directions are
+            // handled at opposite ends. Forward - into a sector we have not reached - puts the
+            // ZDO in two scratch copies, and Visited.Add drops the second sighting. Backward -
+            // into a sector we already finished - would put it in neither, so AddToSectorPatch
+            // records it in PendingAdds and the adds pass below picks it up.
             var scratch = SnapshotState.SectorScratch;
             var sectors = zdoMan.m_objectsBySector;
             for (int s = 0; s < sectors.Length; ++s)
@@ -171,7 +218,6 @@ namespace AsyncSave.Snapshot
 
             // Outside-sector map: flatten all values into scratch in one atomic pass so we
             // never hold a dictionary enumerator across a yield (would throw on mutation).
-            slice.SetPhase(SlicePhase.OutsideSector);
             scratch.Clear();
             foreach (var kv in zdoMan.m_objectsByOutsideSector)
             {
@@ -195,25 +241,26 @@ namespace AsyncSave.Snapshot
             scratch.Clear();
 
             // Reconciliation pass.
-            slice.SetPhase(SlicePhase.Reconcile);
             long reconStartMs = totalStopwatch.ElapsedMilliseconds;
             int reconStartBlocks = slice.Blocks;
             int reconciledMutations = 0;
             int appendedAdds = 0;
+            int unexaminedAdds = 0;
             int dirtyExamined = 0;
-            int missedByHooks = -1;
-            bool dirtyCapHit = false;
             int catchUpExamined = 0;
 
-            // Dirty pass: rewrite only what the revision hooks flagged. The old full scan
-            // walked all 4.9 M entries with a dictionary lookup each to find 21 changes - 36%
-            // of the whole save spent proving nothing had happened.
-            if (reconMode == SAReconcile.Dirty || reconMode == SAReconcile.Verify)
+            // Dirty pass: rewrite only what the revision hooks flagged. The full scan below walks
+            // all 4.9 M entries with a dictionary lookup each to find 21 changes - 36% of the whole
+            // save spent proving nothing had happened.
+            if (reconMode == SAReconcile.Dirty || verify)
             {
                 var dirty = SnapshotState.PendingDirty;
                 var dirtyScratch = SnapshotState.DirtyScratch;
 
-                for (int round = 0; round < MaxDirtyRounds && dirty.Count > 0; ++round)
+                // One extra round past the cap: mutations that arrive during the last round are
+                // not a hook gap, just late, and processing them keeps the verify pass from
+                // counting them as missed.
+                for (int round = 0; round <= MaxCatchUpRounds && dirty.Count > 0; ++round)
                 {
                     // Atomic drain: the revision patches keep adding while we yield, and a
                     // live HashSet enumerator would throw the moment one did. Anything that
@@ -222,6 +269,7 @@ namespace AsyncSave.Snapshot
                     dirtyScratch.AddRange(dirty);
                     dirty.Clear();
                     dirtyExamined += dirtyScratch.Count;
+                    if (round == MaxCatchUpRounds) catchUpExamined = dirtyScratch.Count;
 
                     int i = 0;
                     while (i < dirtyScratch.Count)
@@ -235,38 +283,14 @@ namespace AsyncSave.Snapshot
                         }
                     }
                 }
-
-                // Final catch-up drain: mutations that arrived during the last round
-                // aren't a hook gap, they're just late. Process them once before
-                // handing off to the full scan so Verify doesn't count them as missed.
-                if (dirty.Count > 0)
-                {
-                    dirtyCapHit = true;
-                    dirtyScratch.Clear();
-                    dirtyScratch.AddRange(dirty);
-                    dirty.Clear();
-                    catchUpExamined = dirtyScratch.Count;
-                    dirtyExamined += catchUpExamined;
-
-                    int i = 0;
-                    while (i < dirtyScratch.Count)
-                    {
-                        i = ReconcileDirtyRange(zdoMan, dirtyScratch, i, ref slice, ref reconciledMutations);
-                        if (i < dirtyScratch.Count)
-                        {
-                            slice.EndSlice();
-                            yield return null;
-                            slice.BeginSlice();
-                        }
-                    }
-                }
-                SnapshotState.DirtyScratch.Clear();
+                dirtyScratch.Clear();
             }
 
-            // Full scan: the pre-dirty behaviour, kept as the safety net. Under Verify it runs
-            // *after* the dirty pass and anything it still finds is a hook the dirty path does
-            // not cover - the one failure mode of this design, and silent without this check.
-            if (reconMode == SAReconcile.FullScan || reconMode == SAReconcile.Verify)
+            // Full scan: re-check every entry against live state. Depends on nothing but
+            // DataRevision itself, which is why it stays as the fallback when the revision hooks
+            // are not attached - and as the verify pass's reference for what the hooks missed.
+            int missedByHooks = -1;
+            if (reconMode == SAReconcile.FullScan || verify)
             {
                 int before = reconciledMutations;
                 int n = SnapshotState.EntryCount;
@@ -281,32 +305,43 @@ namespace AsyncSave.Snapshot
                         slice.BeginSlice();
                     }
                 }
-                if (reconMode == SAReconcile.Verify) missedByHooks = reconciledMutations - before;
+                if (verify) missedByHooks = reconciledMutations - before;
             }
 
-            // Append pending adds.
-            slice.SetPhase(SlicePhase.Adds);
+            // Append pending adds: everything AddToSectorPatch saw enter a sector while we
+            // walked - created mid-snapshot, or migrated backwards past the walk.
+            //
+            // The list keeps growing while this runs, because a ZDO can migrate during the adds
+            // pass itself, so each round takes a fresh high-water mark. Rounds are capped for
+            // the same reason the dirty pass caps them: a slice serializes thousands of entries
+            // while even a busy server crosses a few hundred sector boundaries a frame, so this
+            // converges in one or two - but the save has to finish on a world where it doesn't.
+            // Anything left over is overwhelmingly forward migrations that were already
+            // serialized and would have been dropped by Visited.Add anyway.
             {
                 var pendingAdds = SnapshotState.PendingAdds;
                 int i = 0;
-                while (i < pendingAdds.Count)
+                for (int round = 0; round < MaxCatchUpRounds && i < pendingAdds.Count; ++round)
                 {
-                    i = AppendAddsRange(zdoMan, i, ref slice, ref appendedAdds);
-                    if (i < pendingAdds.Count)
+                    int limit = pendingAdds.Count;
+                    while (i < limit)
                     {
-                        slice.EndSlice();
-                        yield return null;
-                        slice.BeginSlice();
+                        i = AppendAddsRange(zdoMan, i, limit, ref slice, ref appendedAdds);
+                        if (i < limit)
+                        {
+                            slice.EndSlice();
+                            yield return null;
+                            slice.BeginSlice();
+                        }
                     }
                 }
+                unexaminedAdds = pendingAdds.Count - i;
             }
 
             long reconMs = totalStopwatch.ElapsedMilliseconds - reconStartMs;
             // +1 for the block still open here: reconcile's tail runs on through the zone
             // capture to the EndSlice below, and that stretch belongs to this phase.
             int reconBlocks = slice.Blocks - reconStartBlocks + 1;
-
-            slice.SetPhase(SlicePhase.Tail);
 
             // Freeze nextUid AFTER the snapshot walk - covers any uids created during yields.
             SnapshotState.NextUid = zdoMan.m_nextUid;
@@ -336,54 +371,36 @@ namespace AsyncSave.Snapshot
             ZoneSnapshot.Ready = true;
 
             // Feed the measured encoding density back so the next save's buffer presize lands
-            // without a grow. Must happen after the walk, before anything can reset Position.
-            SnapshotState.RecordBytesPerZdo(SnapshotState.Buffer.Position, serialized);
+            // without adding a block. Must happen after the walk, before anything resets the
+            // buffer cursor.
+            SnapshotState.RecordBytesPerZdo(SnapshotState.Buffer.TotalBytes, serialized);
 
+#if DEBUG
             // Must run before the save thread is released - it serializes both ways into
             // memory and needs exclusive access to the snapshot and to vanilla's temps.
-            if (verify) VerifyHarness.Compare(zdoMan, savedUniqueHashes);
+            if (verify)
+            {
+                VerifyHarness.Compare(zdoMan, savedUniqueHashes);
+                ReportHookCoverage(missedByHooks, dirtyExamined, catchUpExamined);
+            }
+#endif
 
             _current = null;
             tcs.TrySetResult(true);
 
-            // dirtyExamined is the difference between "the hooks are incomplete" and "the hooks
-            // are not there at all", and those want completely different fixes. Reporting only
-            // the miss count sent a whole debugging session after a phantom game-version change
-            // when the real answer was that the patch file had never been compiled.
-            if (missedByHooks > 0 && dirtyExamined == 0)
+            // Almost always zero, and almost always harmless when it isn't - a forward migration
+            // that was already serialized looks the same here as one we never saw. Reported
+            // anyway, because the harmful case (a backward migration we ran out of rounds for)
+            // is otherwise indistinguishable from a clean save.
+            if (unexaminedAdds > 0)
             {
-                Log.Error($"AsyncSave reconcile verify: the full scan found {missedByHooks} changed ZDOs " +
-                          $"and the dirty pass examined 0. Not a coverage gap - the revision hooks are not " +
-                          $"firing at all, so Dirty mode is currently equivalent to Off. Check for the hook " +
-                          $"error logged at startup; until it is fixed, set 'Reconcile mutations' to FullScan.");
-            }
-            else if (missedByHooks > 0 && dirtyCapHit)
-            {
-                Log.Info($"AsyncSave reconcile verify: the full scan found {missedByHooks} changed ZDOs after " +
-                         $"a dirty pass that examined {dirtyExamined} (including {catchUpExamined} catch-up). " +
-                         $"The dirty pass hit its {MaxDirtyRounds}-round cap on a busy world; the full scan " +
-                         $"already handled the stragglers. No action needed.");
-            }
-            else if (missedByHooks > 0)
-            {
-                Log.Error($"AsyncSave reconcile verify: the full scan still found {missedByHooks} changed " +
-                          $"ZDOs after a dirty pass that examined {dirtyExamined}. The revision hooks likely " +
-                          $"miss a mutation path on this game version. Set 'Reconcile mutations' to FullScan " +
-                          $"until this is understood.");
-            }
-            else if (missedByHooks == 0 && dirtyExamined == 0)
-            {
-                // Both zero proves nothing: an idle world and a dead hook look identical here.
-                Log.Info("AsyncSave reconcile verify: nothing mutated during the snapshot, so the dirty " +
-                         "pass was not exercised. Re-run the check on a world with activity.");
-            }
-            else if (missedByHooks == 0)
-            {
-                Log.Info($"AsyncSave reconcile verify: dirty pass examined {dirtyExamined} ZDOs (including {catchUpExamined} catch-up) and covered " +
-                         $"every mutation the full scan found.");
+                Log.Warn($"AsyncSave: {unexaminedAdds} sector entries arrived faster than the adds pass " +
+                         $"could drain them and were left unexamined after {MaxCatchUpRounds} rounds. Most " +
+                         "will be objects already in this save; a few may be one save behind. Raise the " +
+                         "slice budget if this recurs.");
             }
 
-            if (phaseTimings)
+            if (timings)
             {
                 // Block counts per phase, not just totals: a phase whose wall clock is large
                 // but whose block count is 1 is a freeze, not a slice, and that distinction is
@@ -391,26 +408,13 @@ namespace AsyncSave.Snapshot
                 Log.Info($"AsyncSave phases: connHash={connMs}ms presize={presizeMs}ms " +
                          $"sectorWalk={sectorMs - connMs - presizeMs}ms/{sectorBlocks}blocks " +
                          $"outsideSector={reconStartMs - sectorMs}ms " +
-                          $"reconcile+adds={reconMs}ms/{reconBlocks}blocks (mode={reconMode} dirty={dirtyExamined} catchUp={catchUpExamined}) " +
+                         $"reconcile+adds={reconMs}ms/{reconBlocks}blocks (mode={reconMode} dirty={dirtyExamined} catchUp={catchUpExamined}) " +
                          $"zoneCapture={zoneMs}ms (zones={ZoneSnapshot.ZoneCount} locations={ZoneSnapshot.LocationCount}) " +
                          $"total={totalStopwatch.ElapsedMilliseconds}ms triggerFrame={_triggerFrameMs:0.0}ms " +
                          $"worstBlock={slice.WorstBlockMs:0.00}ms blocks={slice.Blocks} " +
                          $"target={slice.TargetFrameMs:0.0}ms cap={slice.CapTargetMs:0.0}ms " +
                          $"budget={slice.LastBudgetMs:0.00}ms headroom={SASettings.FrameHeadroomPercent.Value}% " +
                          $"baseFrame={slice.BaseFrameMs:0.0}ms");
-
-                // The worst-block scalar on its own cannot tell one big stall from fifty
-                // medium ones, and it never says what the stall was.
-                string hitches = slice.FormatHitches();
-                if (hitches != null)
-                {
-                    Log.Info($"AsyncSave hitches: {slice.HitchCount} block(s) over " +
-                             $"{SASettings.HitchThresholdMs.Value}ms, worst first:{hitches}");
-                }
-                else
-                {
-                    Log.Info($"AsyncSave hitches: none over {SASettings.HitchThresholdMs.Value}ms.");
-                }
             }
 
             int keptCount = SnapshotState.EntryCount - SnapshotState.PendingRemoves.Count;
@@ -419,15 +423,54 @@ namespace AsyncSave.Snapshot
                 Log.Info($"AsyncSave snapshot: {keptCount} ZDOs in {totalStopwatch.ElapsedMilliseconds} ms " +
                          $"over {slice.Blocks} frames (worst block: {slice.WorstBlockMs:0.00} ms).");
             }
-            else if (log == SALogLevel.Detailed)
+            else if (log >= SALogLevel.Detailed)
             {
-                Log.Info($"AsyncSave snapshot: serialized={serialized} reconciled={reconciledMutations} adds={appendedAdds} removes={SnapshotState.PendingRemoves.Count} kept={keptCount} " +
-                         $"buffer={SnapshotState.Buffer.Position} bytes cap={SnapshotState.Buffer.Data.Length} " +
+                Log.Info($"AsyncSave snapshot: serialized={serialized} reconciled={reconciledMutations} " +
+                         $"adds={appendedAdds} removes={SnapshotState.PendingRemoves.Count} kept={keptCount} " +
+                         $"buffer={SnapshotState.Buffer.TotalBytes} bytes cap={SnapshotState.Buffer.Capacity} " +
+                         $"bufBlocks={SnapshotState.Buffer.BlockCount} " +
                          $"bytesPerZdo={SnapshotState.BytesPerZdoEma:0.0} " +
                          $"total={totalStopwatch.ElapsedMilliseconds}ms recon={reconMs}ms " +
                          $"blocks={slice.Blocks} worstBlock={slice.WorstBlockMs:0.00}ms");
             }
         }
+
+#if DEBUG
+        /// Verify mode only: what the full scan still found after the dirty pass had run.
+        ///
+        /// dirtyExamined separates "the hooks are incomplete" from "the hooks are not there at
+        /// all", and those want completely different fixes. Reporting only the miss count once
+        /// sent a whole debugging session after a phantom game-version change when the real
+        /// answer was that the patch file had never been compiled.
+        private static void ReportHookCoverage(int missed, int dirtyExamined, int catchUpExamined)
+        {
+            if (missed > 0 && dirtyExamined == 0)
+            {
+                Log.Error($"AsyncSave reconcile verify: the full scan found {missed} changed ZDOs and the " +
+                          "dirty pass examined 0. Not a coverage gap - the revision hooks are not firing at " +
+                          "all. Check for the hook error logged at startup; until it is fixed, set " +
+                          "'Reconcile mutations' to FullScan.");
+            }
+            else if (missed > 0)
+            {
+                Log.Error($"AsyncSave reconcile verify: the full scan still found {missed} changed ZDOs " +
+                          $"after a dirty pass that examined {dirtyExamined} ({catchUpExamined} of them in " +
+                          "the final catch-up round). The revision hooks likely miss a mutation path on this " +
+                          "game version. Set 'Reconcile mutations' to FullScan until this is understood.");
+            }
+            else if (dirtyExamined == 0)
+            {
+                // Both zero proves nothing: an idle world and a dead hook look identical here.
+                Log.Info("AsyncSave reconcile verify: nothing mutated during the snapshot, so the dirty " +
+                         "pass was not exercised. Re-run the check on a world with activity.");
+            }
+            else
+            {
+                Log.Info($"AsyncSave reconcile verify: dirty pass examined {dirtyExamined} ZDOs and covered " +
+                         "every mutation the full scan found.");
+            }
+        }
+#endif
 
         // The loops below live outside the iterator on purpose. Inside a C# iterator every
         // local becomes a field on the compiler-generated state machine, so each access is a
@@ -445,8 +488,33 @@ namespace AsyncSave.Snapshot
         // at i has not been touched yet. Getting that wrong drops or duplicates a ZDO, and a
         // duplicate is fatal on load (ZDOMan.Load feeds them to Dictionary.Add).
 
-        private static int SerializeRange(System.Collections.Generic.List<ZDO> scratch, int from,
-                                          ref SliceBudget slice, ref int serialized)
+        /// Serialize one ZDO into the next free entry slot. False means it was already in the
+        /// snapshot and nothing was written.
+        ///
+        /// The dedup add comes first because it is also the write of this uid's entry index, and
+        /// the two must agree: publishing entryCount and then not filling that slot would point
+        /// dirty reconciliation at somebody else's record. Every caller therefore does its own
+        /// skip checks - persistence, liveness, pending removal - before calling in.
+        private static bool AppendEntry(ZDO live, VisitedSet visited, SnapshotBuffer buffer,
+                                        ref SnapshotEntry[] entries, ref int entryCount)
+        {
+            if (!visited.Add(live.m_uid, entryCount)) return false;
+
+            int block, offset;
+            int length = ZdoSerializer.Write(live, buffer, out block, out offset);
+
+            if (entryCount == entries.Length) entries = SnapshotState.GrowEntries(entryCount);
+            entries[entryCount].Uid = live.m_uid;
+            entries[entryCount].Block = block;
+            entries[entryCount].Offset = offset;
+            entries[entryCount].Length = length;
+            entries[entryCount].DataRevision = live.DataRevision;
+            ++entryCount;
+            return true;
+        }
+
+        private static int SerializeRange(List<ZDO> scratch, int from, ref SliceBudget slice,
+                                          ref int serialized)
         {
             var visited = SnapshotState.Visited;
             var buffer = SnapshotState.Buffer;
@@ -466,20 +534,7 @@ namespace AsyncSave.Snapshot
 
                 var zdo = scratch[i];
                 if (!zdo.Persistent) continue;
-                // entryCount is the slot this ZDO is about to occupy; handing it to the dedup
-                // set is what lets dirty reconciliation find the record again by uid.
-                if (!visited.Add(zdo.m_uid, entryCount)) continue;
-
-                int offset = buffer.Position;
-                int length = ZdoSerializer.Write(zdo, buffer);
-
-                if (entryCount == entries.Length) entries = SnapshotState.GrowEntries(entryCount);
-                entries[entryCount].Uid = zdo.m_uid;
-                entries[entryCount].Offset = offset;
-                entries[entryCount].Length = length;
-                entries[entryCount].DataRevision = zdo.DataRevision;
-                ++entryCount;
-                ++count;
+                if (AppendEntry(zdo, visited, buffer, ref entries, ref entryCount)) ++count;
             }
 
             serialized = count;
@@ -487,9 +542,41 @@ namespace AsyncSave.Snapshot
             return n;
         }
 
+        private static int AppendAddsRange(ZDOMan zdoMan, int from, int n, ref SliceBudget slice,
+                                           ref int appended)
+        {
+            var pendingAdds = SnapshotState.PendingAdds;
+            var removes = SnapshotState.PendingRemoves;
+            var visited = SnapshotState.Visited;
+            var buffer = SnapshotState.Buffer;
+            var entries = SnapshotState.Entries;
+            int count = appended;
+            int entryCount = SnapshotState.EntryCount;
+
+            for (int i = from; i < n; ++i)
+            {
+                if (slice.Step())
+                {
+                    appended = count;
+                    SnapshotState.EntryCount = entryCount;
+                    return i;
+                }
+
+                var uid = pendingAdds[i];
+                if (removes.Contains(uid)) continue;            // added then removed
+                var live = zdoMan.GetZDO(uid);
+                if (live == null || !live.Persistent) continue;
+                if (AppendEntry(live, visited, buffer, ref entries, ref entryCount)) ++count;
+            }
+
+            appended = count;
+            SnapshotState.EntryCount = entryCount;
+            return n;
+        }
+
         /// Dirty reconciliation: only the uids the revision hooks flagged. O(mutations).
-        private static int ReconcileDirtyRange(ZDOMan zdoMan, System.Collections.Generic.List<ZDOID> dirty,
-                                               int from, ref SliceBudget slice, ref int reconciled)
+        private static int ReconcileDirtyRange(ZDOMan zdoMan, List<ZDOID> dirty, int from,
+                                               ref SliceBudget slice, ref int reconciled)
         {
             var entries = SnapshotState.Entries;
             var buffer = SnapshotState.Buffer;
@@ -507,9 +594,10 @@ namespace AsyncSave.Snapshot
                 // Destroyed after we serialized it - the write phase skips it entirely.
                 if (removes.Count > 0 && removes.Contains(uid)) continue;
 
-                // Never serialized in the main pass: either it was created after the walk
-                // passed its sector (the adds pass picks it up with current data) or it is
-                // not persistent. Either way there is no record here to rewrite.
+                // Never serialized in the main pass: it is not persistent, or it was created
+                // or migrated backwards after the walk passed its sector. In the latter cases
+                // AddToSectorPatch queued it and the adds pass serializes it with current
+                // data. Either way there is no record here to rewrite.
                 int idx;
                 if (!visited.TryGetIndex(uid, out idx)) continue;
 
@@ -519,17 +607,18 @@ namespace AsyncSave.Snapshot
                 var e = entries[idx];
                 if (live.DataRevision == e.DataRevision) continue;
 
-                if (RewriteEntry(live, buffer, ref e)) ++count;
+                RewriteEntry(live, buffer, ref e);
                 entries[idx] = e;
+                ++count;
             }
 
             reconciled = count;
             return n;
         }
 
-        /// Full-scan reconciliation: re-check every entry against live state. O(world), and
-        /// the reason the dirty path exists - but it depends on nothing except DataRevision
-        /// itself, so it stays as the safety net and as Verify's reference.
+        /// Full-scan reconciliation: re-check every entry against live state. O(world), and the
+        /// reason the dirty path exists - but it depends on nothing except DataRevision itself,
+        /// so it stays as the fallback and as the verify pass's reference.
         private static int ReconcileRange(ZDOMan zdoMan, int from, ref SliceBudget slice, ref int reconciled)
         {
             var entries = SnapshotState.Entries;
@@ -543,16 +632,14 @@ namespace AsyncSave.Snapshot
 
                 var e = entries[i];
                 var live = zdoMan.GetZDO(e.Uid);
-                if (live == null)
-                {
-                    // If a remove happened after we serialized, the sector patch put it in
-                    // PendingRemoves - we skip it at write time. Nothing to do here.
-                    continue;
-                }
+                // Removed after we serialized it: the sector patch put it in PendingRemoves and
+                // the write phase skips it. Nothing to do here.
+                if (live == null) continue;
                 if (live.DataRevision == e.DataRevision) continue;
 
-                if (RewriteEntry(live, buffer, ref e)) ++count;
+                RewriteEntry(live, buffer, ref e);
                 entries[i] = e;
+                ++count;
             }
 
             reconciled = count;
@@ -561,22 +648,28 @@ namespace AsyncSave.Snapshot
 
         /// Re-encode one already-serialized ZDO in place where possible.
         ///
-        /// Rewriting in place when the new encoding cannot outgrow the old one keeps entry
-        /// offsets monotonic, which is what lets the write phase coalesce the whole block into
-        /// a single stream write, and stops the buffer's high-water mark from creeping up over
-        /// a long session.
-        private static bool RewriteEntry(ZDO live, SnapshotBuffer buffer, ref SnapshotEntry e)
+        /// Rewriting in place when the new encoding cannot outgrow the old one keeps entry offsets
+        /// monotonic within their block, which is what lets the write phase coalesce a whole block
+        /// into a single stream write, and stops the buffer's high-water mark from creeping up
+        /// over a long session.
+        private static void RewriteEntry(ZDO live, SnapshotBuffer buffer, ref SnapshotEntry e)
         {
-            int tail = buffer.Position;
-            buffer.Position = e.Offset;
-            int newLength = ZdoSerializer.Write(live, buffer, e.Length);
-            buffer.Position = tail;
+            // Rewind onto the record's own slot, rewrite, put the cursor back. This cannot roll to
+            // another block: passing e.Length as maxAllowed makes Write refuse before reserving
+            // anything whenever the new encoding could outgrow the bytes it is replacing.
+            int tailBlock = buffer.Block;
+            int tailOffset = buffer.Position;
+            buffer.Seek(e.Block, e.Offset);
+            int block, offset;
+            int newLength = ZdoSerializer.Write(live, buffer, out block, out offset, e.Length);
+            buffer.Seek(tailBlock, tailOffset);
 
             if (newLength < 0)
             {
                 // Did not fit - append at the tail and orphan the original bytes.
-                e.Offset = buffer.Position;
-                e.Length = ZdoSerializer.Write(live, buffer);
+                e.Length = ZdoSerializer.Write(live, buffer, out block, out offset);
+                e.Block = block;
+                e.Offset = offset;
             }
             else
             {
@@ -584,53 +677,6 @@ namespace AsyncSave.Snapshot
             }
 
             e.DataRevision = live.DataRevision;
-            return true;
-        }
-
-        private static int AppendAddsRange(ZDOMan zdoMan, int from, ref SliceBudget slice, ref int appended)
-        {
-            var pendingAdds = SnapshotState.PendingAdds;
-            var removes = SnapshotState.PendingRemoves;
-            var visited = SnapshotState.Visited;
-            var buffer = SnapshotState.Buffer;
-            var entries = SnapshotState.Entries;
-            int n = pendingAdds.Count;
-            int count = appended;
-            int entryCount = SnapshotState.EntryCount;
-
-            for (int i = from; i < n; ++i)
-            {
-                if (slice.Step())
-                {
-                    appended = count;
-                    SnapshotState.EntryCount = entryCount;
-                    return i;
-                }
-
-                var uid = pendingAdds[i];
-                if (removes.Contains(uid)) continue;             // added then removed
-                var live = zdoMan.GetZDO(uid);
-                if (live == null || !live.Persistent) continue;
-                // Add last, not first: it publishes entryCount as this uid's entry index, so
-                // it must not run on a path that then skips writing the entry - a stale index
-                // would point dirty reconciliation at somebody else's record.
-                if (!visited.Add(uid, entryCount)) continue;     // already serialized in the main pass
-
-                int offset = buffer.Position;
-                int length = ZdoSerializer.Write(live, buffer);
-
-                if (entryCount == entries.Length) entries = SnapshotState.GrowEntries(entryCount);
-                entries[entryCount].Uid = uid;
-                entries[entryCount].Offset = offset;
-                entries[entryCount].Length = length;
-                entries[entryCount].DataRevision = live.DataRevision;
-                ++entryCount;
-                ++count;
-            }
-
-            appended = count;
-            SnapshotState.EntryCount = entryCount;
-            return n;
         }
     }
 }

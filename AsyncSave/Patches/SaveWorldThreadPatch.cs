@@ -100,7 +100,7 @@ namespace AsyncSave.Patches
                 ? $"{SaveAsyncPatch.LastKeptCount} ZDOs, {SaveAsyncPatch.LastZdoBytes / (1024f * 1024f):0.0} MB"
                 : "vanilla path (no snapshot)";
 
-            if (log == SALogLevel.Detailed)
+            if (log >= SALogLevel.Detailed)
             {
                 Log.Info($"AsyncSave world write: {writeMs:0} ms - {what} " +
                          $"(writer parked {waitMs:0} ms on the snapshot, {gateMs:0} ms on the character-save gate).");

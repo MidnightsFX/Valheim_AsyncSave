@@ -67,7 +67,9 @@ namespace AsyncSave.Patches
             // Compares our build against a separate transcription of vanilla's, restoring the
             // side effects in between. Must run before the real build so the bytes we ship are
             // the ones that were checked.
+#if DEBUG
             if (SASettings.VerifyBytes.Value) ProfileVerify.CompareProfilePackage(profile);
+#endif
 
             byte[] array = BuildPackage(profile);
 
@@ -168,7 +170,7 @@ namespace AsyncSave.Patches
             // every future character save.
             try
             {
-                var sw = SASettings.PhaseTimings.Value ? System.Diagnostics.Stopwatch.StartNew() : null;
+                var sw = SASettings.LogTimings ? System.Diagnostics.Stopwatch.StartNew() : null;
 
                 // Vanilla calls ZPackage.GenerateHash(), which re-runs GetArray() and copies the
                 // whole payload again. We already hold the array.

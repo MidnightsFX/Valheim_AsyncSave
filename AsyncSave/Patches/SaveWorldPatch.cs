@@ -46,6 +46,9 @@ namespace AsyncSave.Patches
         /// branch did not get taken.
         private const float MainThreadLogThresholdMs = 50f;
 
+        /// How soon an autosave dropped because the previous writer was still busy comes back.
+        private const float RetryAfterSeconds = 60f;
+
         static bool Prefix(ZNet __instance, ref bool sync, out SaveWorldTiming __state)
         {
             __state = new SaveWorldTiming
@@ -87,7 +90,17 @@ namespace AsyncSave.Patches
             // wait is bounded by whatever is left of the write.
             if (!__state.WasSync && __instance.m_saveThread != null && __instance.m_saveThread.IsAlive)
             {
-                Log.Info("AsyncSave: previous world save is still writing to disk - skipping this autosave.");
+                // ZNet.Save already zeroed m_saveTimer on the way in, so simply returning would
+                // put the next attempt a whole interval away - half an hour by default, and
+                // every time on a disk slow enough to still be writing. Wind the timer forward to
+                // just short of the interval instead, so this retries in a minute. Clamped at
+                // zero so a configured interval shorter than the retry is not made longer by it.
+                float retryIn = Game.m_saveInterval - RetryAfterSeconds;
+                if (retryIn < 0f) retryIn = 0f;
+                if (Game.instance != null) Game.instance.m_saveTimer = retryIn;
+
+                Log.Info("AsyncSave: previous world save is still writing to disk - skipping this " +
+                         $"autosave, retrying in {Game.m_saveInterval - retryIn:0} s.");
                 return false;
             }
 
@@ -107,9 +120,7 @@ namespace AsyncSave.Patches
                 SnapshotCoroutine.Abort(ProfileSave.ForceSync
                     ? "preempted by shutdown save"
                     : "preempted by sync manual save");
-                var reset = new TaskCompletionSource<bool>();
-                reset.SetResult(true);
-                SnapshotState.Task = reset;
+                SnapshotState.SignalNoSnapshot();
                 __state.Ran = true;
                 __state.Sync = sync;
                 return true;
@@ -194,7 +205,12 @@ namespace AsyncSave.Patches
 
             if (!ok)
             {
+                // Both flags, because they answer different questions. TranspilerFailed says the
+                // method body is exactly as vanilla wrote it, so Prefix must get out of the way
+                // entirely. BlockWorldSave says the world-save half is standing down, which is
+                // what makes ShouldForceSync stop downgrading the manual save.
                 TranspilerFailed = true;
+                SASettings.BlockWorldSave();
                 Log.Error("AsyncSave: could not locate the ZDOMan/ZoneSystem/RandEventSystem PrepareSave " +
                           "sequence in ZNet.SaveWorld. Async save is disabled; the vanilla save path is " +
                           "left completely intact. This usually means the game updated.");
@@ -229,13 +245,21 @@ namespace AsyncSave.Patches
 
         /// Determine whether this save should take the synchronous vanilla path.
         /// Autosaves are never forced. Shutdown saves are always forced. The only other caller
-        /// that passes sync is Menu.OnManualSave, which honours the AsyncCommandSave config
+        /// that passes sync is Menu.OnManualSave, which honours the AsyncManualSave config
         /// switch. Called from both Prefix and transpiled IL, which must agree.
         public static bool ShouldForceSync(bool sync)
         {
             if (!sync) return false; // autosave -> never force
             if (ProfileSave.ForceSync) return true; // shutdown -> force
-            return !SASettings.AsyncCommandSave.Value; // command -> honor config
+
+            // With the world save off there is no coroutine to wait on, so there is nothing to
+            // gain by dropping vanilla's save-thread Join - and a lot to lose: the kill switch is
+            // documented as restoring the vanilla path completely, and a Save button that returns
+            // before the bytes are on disk is not that. Checked here rather than in AsyncSaveStart
+            // because the sync downgrade in Prefix happens before the branch that reaches it.
+            if (!SASettings.WorldSaveOn) return true;
+
+            return !SASettings.AsyncManualSave.Value; // manual save -> honour config
         }
 
         // Called from transpiled ZNet.SaveWorld when the sync flag is not forcing vanilla path.
@@ -243,7 +267,7 @@ namespace AsyncSave.Patches
         // (it would have been the receiver for PrepareSave).
         public static void AsyncSaveStart(ZDOMan zdoMan)
         {
-            if (SASettings.WorldSaveEnabled.Value)
+            if (SASettings.WorldSaveOn)
             {
                 SnapshotCoroutine.Start(zdoMan);
                 return;
@@ -258,10 +282,7 @@ namespace AsyncSave.Patches
             SnapshotState.InProgress = false;
             SnapshotState.ReadyForWrite = false;
             ZoneSnapshot.Reset();
-
-            var done = new TaskCompletionSource<bool>();
-            done.SetResult(true);
-            SnapshotState.Task = done;
+            SnapshotState.SignalNoSnapshot();
         }
     }
 }

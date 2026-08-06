@@ -14,7 +14,8 @@ namespace AsyncSave.Snapshot
     /// vanilla's clone is built by sequential Add over the source's slot order, and CopyTo
     /// walks those same slots in the same order.
     ///
-    /// Arrays grow monotonically and are never released - same policy as SnapshotBuffer.
+    /// Arrays grow monotonically within a session and are handed back by ReleasePools when
+    /// the world unloads - same policy as the other snapshot pools.
     internal static class ZoneSnapshot
     {
         public static Vector2i[] Zones = new Vector2i[16384];
@@ -68,6 +69,19 @@ namespace AsyncSave.Snapshot
         public static void Reset()
         {
             Ready = false;
+        }
+
+        /// Drop the arrays back to seed size when a world unloads - see SnapshotState.ReleasePools.
+        public static void ReleasePools()
+        {
+            Ready = false;
+            Zones = new Vector2i[16384];
+            ZoneCount = 0;
+            Locations = new ZoneSystem.LocationInstance[8192];
+            LocationCount = 0;
+            GlobalKeys = new string[64];
+            GlobalKeyCount = 0;
+            FilteredKeys = new string[64];
         }
 
         private static void Grow<T>(ref T[] arr, int need)

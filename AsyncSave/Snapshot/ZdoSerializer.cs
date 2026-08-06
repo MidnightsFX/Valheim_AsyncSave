@@ -24,6 +24,11 @@ namespace AsyncSave.Snapshot
     /// enable the mod on a big-endian runtime - vanilla's BinaryWriter is always little-endian.
     internal static unsafe class ZdoSerializer
     {
+        /// Smallest a ZDO can encode to: the fixed header alone, with no rotation, no connection
+        /// and no extra data. SnapshotCoroutine uses it as the floor when deciding whether a world
+        /// could possibly fit in one snapshot buffer.
+        public const int MinBytesPerZdo = 22;
+
         private const int FlagConn     = 0x0001;
         private const int FlagAnyExtra = 0x00FF;
         private const int FlagRotation = 0x1000;
@@ -38,11 +43,18 @@ namespace AsyncSave.Snapshot
         // branch, exactly as vanilla's `m_rotation != Quaternion.identity.eulerAngles` does.
         private const float UnityEpsilonSq = 9.99999944E-11f;
 
-        /// Serialize one ZDO into buf starting at buf.Position.
-        /// Returns the byte length written, or -1 if the record's worst-case size exceeds
-        /// maxAllowed - in which case nothing is written and buf is untouched.
-        public static int Write(ZDO zdo, SnapshotBuffer buf, int maxAllowed = int.MaxValue)
+        /// Serialize one ZDO at the buffer's write cursor. Returns the byte length written, or -1
+        /// if the record's worst-case size exceeds maxAllowed - in which case nothing is written
+        /// and buf is untouched.
+        ///
+        /// `block` and `offset` report where the record actually landed, which is not always where
+        /// the cursor was on entry: reserving space can roll the buffer to the next block. Callers
+        /// must record these rather than sampling buf.Position beforehand.
+        public static int Write(ZDO zdo, SnapshotBuffer buf, out int block, out int offset,
+                                int maxAllowed = int.MaxValue)
         {
+            block = buf.Block;
+            offset = buf.Position;
             ZDOID uid = zdo.m_uid;
 
             BinarySearchDictionary<int, float> floats;
@@ -90,8 +102,8 @@ namespace AsyncSave.Snapshot
                       | ((dataFlags & DataFlagsTypeMask) << 10)
                       | (hasRot ? FlagRotation : 0);
 
-            // Worst case: 2 flags + 4 sector + 12 position + 4 prefab.
-            int need = 22
+            // Fixed header: 2 flags + 4 sector + 12 position + 4 prefab.
+            int need = MinBytesPerZdo
                      + (hasRot  ? 12 : 0)
                      + (hasConn ? 5 : 0)
                      + (nFloats > 0 ? 2 + nFloats * 8  : 0)   // key + float
@@ -126,9 +138,13 @@ namespace AsyncSave.Snapshot
 
             if (need > maxAllowed) return -1;
 
+            // May roll to the next block, which moves both the array and the offset - hence the
+            // out params, read back here rather than sampled by the caller before the call.
             buf.EnsureFree(need);
             byte[] data = buf.Data;
             int start = buf.Position;
+            block = buf.Block;
+            offset = start;
 
             fixed (byte* origin = data)
             {

@@ -1,35 +1,40 @@
 using HarmonyLib;
-using UnityEngine;
 using AsyncSave.Snapshot;
 
 namespace AsyncSave.Patches
 {
-    /// Track ZDO creation and destruction during snapshot yields.
+    /// Track ZDOs that appear in a sector during snapshot yields, and ZDOs that are destroyed.
     /// Zero cost when SnapshotState.InProgress is false.
+
+    /// The coroutine walks m_objectsBySector from index 0 upward and yields between sectors, so
+    /// the sector a ZDO lives in decides whether the walk has already been past it. Every way a
+    /// ZDO can end up in a sector funnels through ZDOMan.AddToSector - ZDO.Initialize on creation,
+    /// ZDO.SetSector on every move - which makes this one hook the complete set of ZDOs the walk
+    /// might otherwise miss:
     ///
-    /// We hook the true creation and destruction sites, not AddToSector/RemoveFromSector,
-    /// because those are also called during sector migration (every position change) and
-    /// would bloat pendingAdds with false positives.
-
-    [HarmonyPatch]
-    internal static class CreateNewZdoPatch
+    ///  - created mid-snapshot: never in any scratch copy;
+    ///  - migrated *backwards*, from a sector the walk has not reached into one it already
+    ///    finished: absent from both scratch copies. This is data loss - the ZDO simply is not in
+    ///    the save file - and it hits exactly the objects that move, which are the ones a player
+    ///    notices missing: carts, ships, tamed creatures, dropped items.
+    ///
+    /// Forward migration is the harmless case and needs no help: the ZDO appears in both the old
+    /// sector's scratch (already processed) and the new sector's (about to be), and Visited.Add
+    /// drops the second sighting.
+    ///
+    /// An earlier version hooked ZDOMan.CreateNewZDO instead, on the grounds that AddToSector also
+    /// fires for migration and would "bloat PendingAdds with false positives". Migration is the
+    /// case that matters, and the false positives are free: AppendAddsRange re-checks removes,
+    /// liveness, persistence and Visited, so a uid that was already serialized costs one hash
+    /// probe and is dropped.
+    [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.AddToSector))]
+    internal static class AddToSectorPatch
     {
-        // Targets the private CreateNewZDO(ZDOID, Vector3, int) - the sole authoritative
-        // creation site (both for new local ZDOs and for network-received ZDOs).
-        [HarmonyTargetMethod]
-        static System.Reflection.MethodInfo Target()
-        {
-            return AccessTools.DeclaredMethod(
-                typeof(ZDOMan),
-                nameof(ZDOMan.CreateNewZDO),
-                new[] { typeof(ZDOID), typeof(Vector3), typeof(int) });
-        }
-
         [HarmonyPostfix]
-        static void Postfix(ZDO __result)
+        static void Postfix(ZDO zdo)
         {
-            if (!SnapshotState.InProgress || __result == null) return;
-            SnapshotState.PendingAdds.Add(__result.m_uid);
+            if (!SnapshotState.InProgress || zdo == null) return;
+            SnapshotState.PendingAdds.Add(zdo.m_uid);
         }
     }
 
