@@ -8,13 +8,13 @@ using SASettings = AsyncSave.Config.Settings;
 
 namespace AsyncSave
 {
-    [BepInPlugin(ModGuid, ModName, ModVersion)]
+    [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     [BepInIncompatibility("org.bepinex.plugins.smoothsave")]
     public class AsyncSavePlugin : BaseUnityPlugin
     {
-        public const string ModGuid = "MidnightsFX.AsyncSave";
-        public const string ModName = "AsyncSave";
-        public const string ModVersion = "0.3.0";
+        public const string PluginGUID = "MidnightsFX.AsyncSave";
+        public const string PluginName = "AsyncSave";
+        public const string PluginVersion = "0.3.0";
 
         private Harmony _harmony;
 
@@ -47,12 +47,12 @@ namespace AsyncSave
 
             SaveIo.Start();
 
-            _harmony = new Harmony(ModGuid);
+            _harmony = new Harmony(PluginGUID);
             _harmony.PatchAll(Assembly.GetExecutingAssembly());
 
             VerifyRevisionHooks();
 
-            Log.Info($"{ModName} {ModVersion} loaded.");
+            Log.Info($"{PluginName} {PluginVersion} loaded.");
         }
 
         /// Dirty reconciliation is only correct while both ZDO revision hooks are live, and a
@@ -97,7 +97,7 @@ namespace AsyncSave
             {
                 foreach (var postfix in info.Postfixes)
                 {
-                    if (postfix.owner != ModGuid) continue;
+                    if (postfix.owner != PluginGUID) continue;
                     ours = true;
                     break;
                 }

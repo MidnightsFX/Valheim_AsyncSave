@@ -5,3 +5,4 @@ AsyncSave/obj/*
 
 # built dll dropped into the thunderstore package by the Release build
 AsyncSave/Package/plugins/*
+.env
