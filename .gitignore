@@ -2,3 +2,6 @@
 AsyncSave/bin/*
 AsyncSave/obj/*
 .kilo/*
+
+# built dll dropped into the thunderstore package by the Release build
+AsyncSave/Package/plugins/*
