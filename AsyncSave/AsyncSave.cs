@@ -14,7 +14,7 @@ namespace AsyncSave
     {
         public const string PluginGUID = "MidnightsFX.AsyncSave";
         public const string PluginName = "AsyncSave";
-        public const string PluginVersion = "0.3.0";
+        public const string PluginVersion = "0.4.0";
 
         private Harmony _harmony;
 
@@ -107,11 +107,13 @@ namespace AsyncSave
             missing = missing == null ? label : missing + " and " + label;
         }
 
-        /// Main-thread completion pump for the character-save pipeline. BaseUnityPlugin is
-        /// already a MonoBehaviour and outlives scene loads, so this needs no patch of its own.
+        /// Main-thread completion pump for the character-save pipeline, and the dead-ZDO
+        /// expiry pass. BaseUnityPlugin is already a MonoBehaviour and outlives scene loads, so
+        /// these need no patch of their own.
         public void Update()
         {
             ProfileSave.Pump();
+            DeadZdoPruner.Pump();
         }
 
         public void OnDestroy()

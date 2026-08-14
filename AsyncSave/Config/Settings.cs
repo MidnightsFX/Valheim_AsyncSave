@@ -27,6 +27,8 @@ namespace AsyncSave.Config
         // 1 - General
         public static ConfigEntry<int> SaveIntervalSeconds;
         public static ConfigEntry<LogLevel> Logging;
+        public static ConfigEntry<bool> DeadZdoPruning;
+        public static ConfigEntry<int> DeadZdoTtlSeconds;
 
         // 2 - World Save (server side; a client never runs the world save at all)
         public static ConfigEntry<bool> WorldSaveEnabled;
@@ -94,6 +96,23 @@ namespace AsyncSave.Config
             Logging = cfg.Bind(
                 "1 - General", "Logging", LogLevel.Simple,
                 "Amount of information written to the log per save. Debug adds per-phase timings.");
+
+            DeadZdoPruning = cfg.Bind(
+                "1 - General", "Prune dead ZDO records", true,
+                "Expire the server's table of recently-destroyed ZDOs instead of letting it grow for " +
+                "the whole session. Vanilla adds an entry for every destroyed ZDO and only ever clears " +
+                "the table when a world loads, but reads it for one purpose: rejecting a create for a " +
+                "ZDO that died while a client's packet was in flight. On a busy large world that is " +
+                "millions of entries retained to answer a question about the last few seconds. " +
+                "Server-side only; a client never fills this table.");
+
+            DeadZdoTtlSeconds = cfg.Bind(
+                "1 - General", "Dead ZDO record lifetime (seconds)", 60,
+                new ConfigDescription(
+                    "How long a destroyed ZDO stays in that table before being pruned. It only has to " +
+                    "outlast a client's round-trip, so the default is already far more than needed. " +
+                    "Raise it if you see destroyed objects reappearing on very high-latency clients.",
+                    new AcceptableValueRange<int>(30, 3600)));
 
             // The two halves are independent on purpose: this DLL is meant to run unmodified on
             // a dedicated server, on a client, or on a host. Neither half syncs anything over

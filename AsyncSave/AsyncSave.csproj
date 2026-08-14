@@ -92,6 +92,7 @@
   <ItemGroup>
     <Compile Include="AsyncSave.cs" />
     <Compile Include="Config\Settings.cs" />
+    <Compile Include="Patches\DeadZdoPruner.cs" />
     <Compile Include="Patches\SaveAsyncPatch.cs" />
     <Compile Include="Patches\SavePlayerProfilePatch.cs" />
     <Compile Include="Patches\SavePlayerToDiskPatch.cs" />
