@@ -56,16 +56,17 @@ namespace AsyncSave.Patches
             }
 
             // Taken here rather than around the file write so it also covers vanilla's
-            // SaveSystem.CheckMove / CreateBackup prologue.
+            // ConsiderAutoBackup / PreSaveCloudChecksAndOperations prologue, which touches the
+            // same SaveSystem statics the character worker does.
             long t1 = Stopwatch.GetTimestamp();
             Monitor.Enter(SaveIo.Gate);
             __state.GateTicks = Stopwatch.GetTimestamp() - t1;
             __state.GateHeld = true;
 
             // Cleared before the body, not after: on a forced-sync save vanilla's own
-            // ZDOMan.SaveAsync runs and our prefix never sets them, and stale figures from the
+            // ZDOMan.SaveChunks runs and our prefix never sets them, and stale figures from the
             // previous async save would be indistinguishable from real ones.
-            SaveAsyncPatch.ResetWriteStats();
+            SaveChunksPatch.ResetWriteStats();
 
             __state.BodyStart = Stopwatch.GetTimestamp();
             return true;
@@ -96,8 +97,9 @@ namespace AsyncSave.Patches
             float waitMs = state.WaitTicks * perMs;
             float gateMs = state.GateTicks * perMs;
 
-            string what = SaveAsyncPatch.LastWasSnapshot
-                ? $"{SaveAsyncPatch.LastKeptCount} ZDOs, {SaveAsyncPatch.LastZdoBytes / (1024f * 1024f):0.0} MB"
+            string what = SaveChunksPatch.LastWasSnapshot
+                ? $"{SaveChunksPatch.LastKeptCount} ZDOs, {SaveChunksPatch.LastZdoBytes / (1024f * 1024f):0.0} MB " +
+                  $"across {SaveChunksPatch.LastChunkCount} chunk file(s)"
                 : "vanilla path (no snapshot)";
 
             if (log >= SALogLevel.Detailed)

@@ -1,29 +1,41 @@
+using System.Collections;
 using System.IO;
 using System.IO.Compression;
 
 namespace AsyncSave.Profile
 {
-    /// Main-thread capture of the minimap, plus the worker-side compression.
+    /// Main-thread capture of the minimap, plus the worker-side expansion and compression.
     ///
     /// Vanilla's Minimap.GetMapData writes m_explored and m_exploredOthers one bool at a time -
     /// at the shipped texture size of 2048 that is 8,388,608 virtual BinaryWriter.Write(bool)
-    /// calls into a MemoryStream that starts empty and doubles ~24 times. Two Buffer.BlockCopy
-    /// calls produce the identical byte sequence: a bool[] is one byte per element and
-    /// BinaryWriter.Write(bool) emits 0/1. Minimap.SetMapData already reads these blocks back
-    /// with ReadByteArray(m_explored.Length), so vanilla itself treats them as a raw byte block
-    /// on load - the per-bool loop is only on the write side.
+    /// calls into a MemoryStream that starts empty and doubles ~24 times. The bytes it produces
+    /// are just 0/1 per bit, and Minimap.SetMapData reads them back with
+    /// ReadByteArray(m_explored.Length), so the whole thing is a byte-per-bit block in both
+    /// directions - the per-bool loop is only on the write side.
     ///
-    /// Only the GZip runs on the worker. Everything here touches Unity-owned state and must be
-    /// captured atomically on the main thread: m_pins is rebuilt every frame by
-    /// UpdateDynamicPins, and PinData holds Sprite/RectTransform/GameObject references that must
-    /// never cross a thread boundary.
+    /// Since the chunked-save update those two are BitArrays rather than bool[], which is
+    /// actually better for us: BitArray.CopyTo packs the whole thing into an int[] in one
+    /// memcpy, so the main thread now copies 1 MB instead of 8 MB, and the byte-per-bit
+    /// expansion moves to the worker alongside the GZip.
+    ///
+    /// Everything captured here touches Unity-owned state and must be captured atomically on the
+    /// main thread: m_pins is rebuilt every frame by UpdateDynamicPins, and PinData holds
+    /// Sprite/RectTransform/GameObject references that must never cross a thread boundary.
     internal static class MapSnapshot
     {
         // Pooled, grown monotonically, never released - same policy as SnapshotBuffer.
         private static byte[] _payload = new byte[0];
         private static int _payloadLength;
 
+        // Packed bits straight out of BitArray.CopyTo, expanded on the worker.
+        private static int[] _exploredBits = new int[0];
+        private static int[] _exploredOthersBits = new int[0];
+        private static int _bitCount;
+        private static int _textureSize;
+        private static bool _publicPosition;
+
         private static readonly MemoryStream _pinBlock = new MemoryStream(1024);
+        private static int _pinLength;
 
         /// Exactly what BinaryWriter uses by default, which is what ZPackage's writer is
         /// constructed with. Encoding.UTF8 would differ on malformed input (replacement
@@ -39,16 +51,22 @@ namespace AsyncSave.Profile
             _payloadLength = 0;
         }
 
-        /// Main thread, no yields. Assembles the uncompressed map payload exactly as
-        /// Minimap.GetMapData's inner ZPackage would.
+        /// Main thread, no yields. Grabs everything the payload needs; the assembly itself
+        /// happens on the worker in Compress.
         public static void Capture(Minimap map)
         {
             // Vanilla bounds BOTH loops by m_explored.Length. The arrays are allocated to the
             // same size in Minimap.Start, but mirror the original exactly.
             int n = map.m_explored.Length;
+            _bitCount = n;
+            _textureSize = map.m_textureSize;
 
-            // Pins first - the block is small and variable-length, so building it separately
-            // lets the two big blocks land at fixed offsets with a straight memcpy.
+            int words = (n + 31) / 32;
+            if (_exploredBits.Length < words) _exploredBits = new int[words];
+            if (_exploredOthersBits.Length < words) _exploredOthersBits = new int[words];
+            map.m_explored.CopyTo(_exploredBits, 0);
+            map.m_exploredOthers.CopyTo(_exploredOthersBits, 0);
+
             _pinBlock.SetLength(0);
             _pinBlock.Position = 0;
             using (var pinWriter = new BinaryWriter(_pinBlock, PinEncoding, true))
@@ -78,29 +96,20 @@ namespace AsyncSave.Profile
                 }
                 pinWriter.Flush();
             }
-            int pinLength = (int)_pinBlock.Length;
+            _pinLength = (int)_pinBlock.Length;
 
-            //  [int textureSize][n explored][n exploredOthers][int pinCount + pins][bool publicPos]
-            int required = 4 + n + n + pinLength + 1;
-            if (_payload.Length < required) _payload = new byte[required];
-            var buf = _payload;
+            _publicPosition = ZNet.instance.IsReferencePositionPublic();
 
-            int p = 0;
-            WriteInt(buf, p, map.m_textureSize); p += 4;
-            System.Buffer.BlockCopy(map.m_explored, 0, buf, p, n); p += n;
-            System.Buffer.BlockCopy(map.m_exploredOthers, 0, buf, p, n); p += n;
-            System.Buffer.BlockCopy(_pinBlock.GetBuffer(), 0, buf, p, pinLength); p += pinLength;
-            buf[p++] = ZNet.instance.IsReferencePositionPublic() ? (byte)1 : (byte)0;
-
-            _payloadLength = p;
             HasCapture = true;
         }
 
         /// Worker thread. Produces exactly what Minimap.GetMapData returns:
-        /// the outer ZPackage is [int MAPVERSION][int compressedLength][gzip bytes], which is
+        /// the outer ZPackage is [int mapVersion][int compressedLength][gzip bytes], which is
         /// what ZPackage.WriteCompressed emits (length prefix, then the raw buffer).
         public static byte[] Compress()
         {
+            BuildPayload();
+
             byte[] compressed;
             using (var output = new MemoryStream())
             {
@@ -114,16 +123,62 @@ namespace AsyncSave.Profile
             }
 
             var result = new byte[8 + compressed.Length];
-            WriteInt(result, 0, Minimap.MAPVERSION);
+            WriteInt(result, 0, ProfileFormat.MapVersion);
             WriteInt(result, 4, compressed.Length);
             System.Buffer.BlockCopy(compressed, 0, result, 8, compressed.Length);
             return result;
+        }
+
+        /// [int textureSize][n explored][n exploredOthers][int pinCount + pins][bool publicPos]
+        private static void BuildPayload()
+        {
+            int n = _bitCount;
+            int required = 4 + n + n + _pinLength + 1;
+            if (_payload.Length < required) _payload = new byte[required];
+            var buf = _payload;
+
+            int p = 0;
+            WriteInt(buf, p, _textureSize); p += 4;
+            Expand(_exploredBits, buf, p, n); p += n;
+            Expand(_exploredOthersBits, buf, p, n); p += n;
+            System.Buffer.BlockCopy(_pinBlock.GetBuffer(), 0, buf, p, _pinLength); p += _pinLength;
+            buf[p++] = _publicPosition ? (byte)1 : (byte)0;
+
+            _payloadLength = p;
+        }
+
+        /// One byte per bit, which is what BinaryWriter.Write(bool) emits. Whole words are
+        /// unrolled so the common case never touches the loop counter's division.
+        private static void Expand(int[] bits, byte[] dest, int offset, int count)
+        {
+            int full = count >> 5;
+            int at = offset;
+            for (int w = 0; w < full; ++w)
+            {
+                int word = bits[w];
+                for (int b = 0; b < 32; ++b)
+                {
+                    dest[at + b] = (byte)((word >> b) & 1);
+                }
+                at += 32;
+            }
+
+            int remaining = count & 31;
+            if (remaining != 0)
+            {
+                int word = bits[full];
+                for (int b = 0; b < remaining; ++b)
+                {
+                    dest[at + b] = (byte)((word >> b) & 1);
+                }
+            }
         }
 
 #if DEBUG
         /// Uncompressed payload, for the verify harness only.
         public static byte[] DebugPayloadCopy()
         {
+            BuildPayload();
             var copy = new byte[_payloadLength];
             System.Buffer.BlockCopy(_payload, 0, copy, 0, _payloadLength);
             return copy;

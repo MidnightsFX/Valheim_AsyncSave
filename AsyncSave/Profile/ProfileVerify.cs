@@ -1,5 +1,6 @@
 #if DEBUG
 using System;
+using System.Collections.Generic;
 using AsyncSave.Patches;
 using AsyncSave.Util;
 
@@ -8,9 +9,9 @@ namespace AsyncSave.Profile
     /// Debug-only proof that the hand-written character serializers match vanilla byte for byte.
     ///
     /// This is the safety net for the two places AsyncSave reproduces a save format by hand:
-    /// the minimap payload (where 8.4 M per-bool writes became two memcpys) and the .fch
-    /// ZPackage. Both are character data, so run this before trusting the async path on a
-    /// character you care about.
+    /// the minimap payload (where 8.4 M per-bool writes became a packed CopyTo plus a worker-side
+    /// expansion) and the .fch ZPackage. Both are character data, so run this before trusting the
+    /// async path on a character you care about.
     internal static class ProfileVerify
     {
         /// Compare our uncompressed map payload against vanilla's inner ZPackage.
@@ -55,24 +56,30 @@ namespace AsyncSave.Profile
         /// Compare our .fch package against vanilla's.
         ///
         /// Order matters: vanilla's build mutates m_lastSaveLoad and increments the
-        /// known-world / known-key playtime counters, so the two passes cannot produce
-        /// identical bytes unless that state is restored between them.
+        /// known-world / known-key playtime counters in two of the ten difficulty slots, so the
+        /// two passes cannot produce identical bytes unless that state is restored between them.
         public static void CompareProfilePackage(PlayerProfile profile)
         {
             try
             {
                 DateTime savedLastSaveLoad = profile.m_lastSaveLoad;
-                var savedKnownWorlds = new System.Collections.Generic.Dictionary<string, float>(profile.m_knownWorlds);
-                var savedKnownWorldKeys = new System.Collections.Generic.Dictionary<string, float>(profile.m_knownWorldKeys);
+                var savedWorlds = new Dictionary<string, float>[ProfileFormat.DifficultySlots];
+                var savedKeys = new Dictionary<string, float>[ProfileFormat.DifficultySlots];
+                for (int i = 0; i < ProfileFormat.DifficultySlots; ++i)
+                {
+                    savedWorlds[i] = new Dictionary<string, float>(profile.m_playerStats[i].m_knownWorlds);
+                    savedKeys[i] = new Dictionary<string, float>(profile.m_playerStats[i].m_knownWorldKeys);
+                }
 
                 byte[] ours = SavePlayerToDiskPatch.BuildPackage(profile);
 
                 // Rewind the side effects so vanilla's pass starts from the same state.
                 profile.m_lastSaveLoad = savedLastSaveLoad;
-                profile.m_knownWorlds.Clear();
-                foreach (var kv in savedKnownWorlds) profile.m_knownWorlds[kv.Key] = kv.Value;
-                profile.m_knownWorldKeys.Clear();
-                foreach (var kv in savedKnownWorldKeys) profile.m_knownWorldKeys[kv.Key] = kv.Value;
+                for (int i = 0; i < ProfileFormat.DifficultySlots; ++i)
+                {
+                    Restore(profile.m_playerStats[i].m_knownWorlds, savedWorlds[i]);
+                    Restore(profile.m_playerStats[i].m_knownWorldKeys, savedKeys[i]);
+                }
 
                 byte[] vanilla = VanillaPackage(profile);
 
@@ -84,15 +91,38 @@ namespace AsyncSave.Profile
             }
         }
 
+        private static void Restore(Dictionary<string, float> live, Dictionary<string, float> saved)
+        {
+            live.Clear();
+            foreach (var kv in saved) live[kv.Key] = kv.Value;
+        }
+
         /// A literal transcription of PlayerProfile.SavePlayerToDisk's ZPackage build, kept
         /// separate from the production copy on purpose - if both were the same code this
         /// would prove nothing. Only reachable from the debug toggle.
+        ///
+        /// Deliberately spells out the literals vanilla uses rather than referencing
+        /// ProfileFormat, for the same reason.
         private static byte[] VanillaPackage(PlayerProfile p)
         {
             var pkg = new ZPackage();
-            pkg.Write(43);
-            pkg.Write(105);
-            for (int key = 0; key < 105; ++key) pkg.Write(p.m_playerStats.m_stats[(PlayerStatType)key]);
+            pkg.Write(46);
+            pkg.Write(205);
+            pkg.Write(10);
+            for (int i = 0; i < 10; ++i)
+            {
+                for (int j = 0; j < 205; ++j) pkg.Write(p.m_playerStats[i].m_stats[(PlayerStatType)j]);
+                WriteMap(pkg, p.m_playerStats[i].m_knownWorlds);
+                WriteMap(pkg, p.m_playerStats[i].m_knownWorldKeys);
+                WriteMap(pkg, p.m_playerStats[i].m_knownCommands);
+                pkg.Write(5);
+                for (int k = 0; k < 5; ++k) WriteMap(pkg, p.m_playerStats[i].m_enemyStats[k]);
+                WriteMap(pkg, p.m_playerStats[i].m_itemPickupStats);
+                WriteMap(pkg, p.m_playerStats[i].m_itemCraftStats);
+                WriteMap(pkg, p.m_playerStats[i].m_pickableStats);
+                WriteMap(pkg, p.m_playerStats[i].m_foodEatenStats);
+                WriteMap(pkg, p.m_playerStats[i].m_piecesPlacedStats);
+            }
             pkg.Write(p.m_firstSpawn);
             pkg.Write(p.m_worldData.Count);
             foreach (var kv in p.m_worldData)
@@ -117,28 +147,30 @@ namespace AsyncSave.Profile
             pkg.Write(new DateTimeOffset(p.m_dateCreated).ToUnixTimeSeconds());
             if ((bool)(UnityEngine.Object)ZNet.instance && (bool)(UnityEngine.Object)ZoneSystem.instance && ZNet.World != null)
             {
-                p.m_knownWorlds.IncrementOrSet(ZNet.instance.GetWorldName(), totalSeconds);
-                for (int key = 0; key < 43; ++key)
+                int difficulty = Achievements.GetCurrentAchievementDifficultyIndex();
+                p.m_playerStats[0].m_knownWorlds.IncrementOrSet(ZNet.instance.GetWorldName(), totalSeconds);
+                p.m_playerStats[difficulty].m_knownWorlds.IncrementOrSet(ZNet.instance.GetWorldName(), totalSeconds);
+                for (int key = 0; key < 53; ++key)
                 {
                     string value;
                     if (ZoneSystem.instance.GetGlobalKey((GlobalKeys)key, out value))
-                        p.m_knownWorldKeys.IncrementOrSet($"{((GlobalKeys)key).ToString().ToLower()} {value}", totalSeconds);
+                    {
+                        p.m_playerStats[0].m_knownWorldKeys.IncrementOrSet(((GlobalKeys)key).ToString().ToLower() + " " + value, totalSeconds);
+                        p.m_playerStats[difficulty].m_knownWorldKeys.IncrementOrSet(((GlobalKeys)key).ToString().ToLower() + " " + value, totalSeconds);
+                    }
                     else
-                        p.m_knownWorldKeys.IncrementOrSet(((GlobalKeys)key).ToString().ToLower() + " default", totalSeconds);
+                    {
+                        p.m_playerStats[0].m_knownWorldKeys.IncrementOrSet(((GlobalKeys)key).ToString().ToLower() + " default", totalSeconds);
+                        p.m_playerStats[difficulty].m_knownWorldKeys.IncrementOrSet(((GlobalKeys)key).ToString().ToLower() + " default", totalSeconds);
+                    }
                 }
             }
-            WriteMap(pkg, p.m_knownWorlds);
-            WriteMap(pkg, p.m_knownWorldKeys);
-            WriteMap(pkg, p.m_knownCommands);
-            WriteMap(pkg, p.m_enemyStats);
-            WriteMap(pkg, p.m_itemPickupStats);
-            WriteMap(pkg, p.m_itemCraftStats);
             if (p.m_playerData != null) { pkg.Write(true); pkg.Write(p.m_playerData); }
             else pkg.Write(false);
             return pkg.GetArray();
         }
 
-        private static void WriteMap(ZPackage pkg, System.Collections.Generic.Dictionary<string, float> map)
+        private static void WriteMap(ZPackage pkg, Dictionary<string, float> map)
         {
             pkg.Write(map.Count);
             foreach (var kv in map) { pkg.Write(kv.Key); pkg.Write(kv.Value); }

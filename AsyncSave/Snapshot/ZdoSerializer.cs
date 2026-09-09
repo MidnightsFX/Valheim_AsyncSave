@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
 using UnityEngine;
@@ -5,18 +6,35 @@ using UnityEngine;
 namespace AsyncSave.Snapshot
 {
     /// Replicates ZDO.Save's byte layout, reading live state (no clone, no snapshot dictionaries).
-    /// Layout (must match ZDO.Save at DecompiledProject/assembly_valheim/ZDO.cs:636-685):
-    ///   ushort flags | Vector2s sector | Vector3 position | int prefab
-    ///   [Vector3 rotation]                                          if flag 0x1000
+    /// Layout (must match ZDO.Save at DecompiledProject/assembly_valheim/ZDO.cs, `public void
+    /// Save(ZPackage pkg)`):
+    ///   ushort flags
+    ///   [short x, short y]   if SmallPosition (0x2000), else [float x, y, z]
+    ///   int prefab
+    ///   [small rotation, 2 or 4 bytes]                              if Rotation (0x1000)
     ///   if any of flags 0x01..0x80 set, then:
-    ///     [byte connectionType | int connectionHash]                if flag 0x01
-    ///     [NumItems | (int key, float value)*]                      if flag 0x02
-    ///     [NumItems | (int key, Vector3 value)*]                    if flag 0x04
-    ///     [NumItems | (int key, Quaternion value)*]                 if flag 0x08
-    ///     [NumItems | (int key, int value)*]                        if flag 0x10
-    ///     [NumItems | (int key, long value)*]                       if flag 0x20
-    ///     [NumItems | (int key, string value)*]                     if flag 0x40
-    ///     [NumItems | (int key, byte[] value)*]                     if flag 0x80
+    ///     [byte connectionType | int connectionHash]                if Connections (0x01)
+    ///     [NumItems | (int key, float value)*]                      if Floats      (0x02)
+    ///     [NumItems | (int key, Vector3 value)*]                    if Vec3        (0x04)
+    ///     [NumItems | (int key, Quaternion value)*]                 if Quaternions (0x08)
+    ///     [NumItems | (int key, int value)*]                        if Ints        (0x10)
+    ///     [NumItems | (int key, long value)*]                       if Longs       (0x20)
+    ///     [NumItems | (int key, string value)*]                     if Strings     (0x40)
+    ///     [NumItems | (int key, byte[] value)*]                     if ByteArrays  (0x80)
+    ///
+    /// Three things changed with the chunked save format and are worth calling out, because each
+    /// is a silent corruption if it drifts back:
+    ///
+    ///  - The sector field is gone. It used to sit between the flags and the position; ZDOMan
+    ///    now recomputes it from the position on load.
+    ///  - Position is packed to a Vector2s when it round-trips exactly and y is zero, which is
+    ///    the common case for anything sitting on the ground. Rotation is packed by
+    ///    ZPackage.WriteSmallRotation. Both decisions come from the game's own helpers
+    ///    (Utils.SmallPosition / Utils.CloseToZero) rather than being reimplemented - they are
+    ///    bit-exact float predicates and reimplementing them is how you lose a world.
+    ///  - Extra data is filtered against ZDOExtraData.s_sessionOnly. Vanilla does this in
+    ///    GetSaveData, after PrepareSave has cloned; we do it inline, which means the section
+    ///    flag has to be decided on the *filtered* count, not the raw one.
     ///
     /// The whole record is sized up front and written through one pinned pointer, so there
     /// is exactly one capacity check and one Position store per ZDO rather than per field.
@@ -24,24 +42,20 @@ namespace AsyncSave.Snapshot
     /// enable the mod on a big-endian runtime - vanilla's BinaryWriter is always little-endian.
     internal static unsafe class ZdoSerializer
     {
-        /// Smallest a ZDO can encode to: the fixed header alone, with no rotation, no connection
-        /// and no extra data. SnapshotCoroutine uses it as the floor when deciding whether a world
-        /// could possibly fit in one snapshot buffer.
-        public const int MinBytesPerZdo = 22;
+        /// Smallest a ZDO can encode to: flags, a packed position and the prefab, with no
+        /// rotation, no connection and no extra data. SnapshotCoroutine uses it as the floor when
+        /// deciding whether a chunk could possibly fit in one snapshot buffer.
+        public const int MinBytesPerZdo = 10;
 
         private const int FlagConn     = 0x0001;
         private const int FlagAnyExtra = 0x00FF;
         private const int FlagRotation = 0x1000;
+        private const int FlagSmallPos = 0x2000;
 
         // ZDO.DataFlags: Type = 3 (bits 0-1, used as a mask), Persistent = 4, Distant = 8.
         // The saved flag word wants Type at bits 10-11, Persistent at 0x100, Distant at 0x200.
         private const int DataFlagsTypeMask = 0x03;
         private const int DataFlagsPersistDistantMask = 0x0C;
-
-        // Unity's Vector3 == is a squared-magnitude compare against kEpsilon squared. Written
-        // as !(sq < eps) rather than (sq >= eps) so a NaN component takes the has-rotation
-        // branch, exactly as vanilla's `m_rotation != Quaternion.identity.eulerAngles` does.
-        private const float UnityEpsilonSq = 9.99999944E-11f;
 
         /// Serialize one ZDO at the buffer's write cursor. Returns the byte length written, or -1
         /// if the record's worst-case size exceeds maxAllowed - in which case nothing is written
@@ -74,18 +88,32 @@ namespace AsyncSave.Snapshot
             ZDOExtraData.s_byteArrays.TryGetValue(uid, out bytes);
             ZDOExtraData.s_connectionsHashData.TryGetValue(uid, out conn);
 
-            int nFloats  = floats  != null ? floats.Count  : 0;
-            int nVec3s   = vec3s   != null ? vec3s.Count   : 0;
-            int nQuats   = quats   != null ? quats.Count   : 0;
-            int nInts    = ints    != null ? ints.Count    : 0;
-            int nLongs   = longs   != null ? longs.Count   : 0;
-            int nStrings = strings != null ? strings.Count : 0;
-            int nBytes   = bytes   != null ? bytes.Count   : 0;
+            // Session-only keys are dropped from the save, so every count below is the count of
+            // keys that survive the filter. s_sessionOnly is a couple of dozen entries and almost
+            // never hits, but it has to be consulted per key: vanilla's GetSaveData does.
+            var sessionOnly = ZDOExtraData.s_sessionOnly;
+            bool anySession = sessionOnly.Count > 0;
+
+            int nFloats  = Kept(floats,  sessionOnly, anySession);
+            int nVec3s   = Kept(vec3s,   sessionOnly, anySession);
+            int nQuats   = Kept(quats,   sessionOnly, anySession);
+            int nInts    = Kept(ints,    sessionOnly, anySession);
+            int nLongs   = Kept(longs,   sessionOnly, anySession);
+            int nStrings = Kept(strings, sessionOnly, anySession);
+            int nBytes   = Kept(bytes,   sessionOnly, anySession);
             bool hasConn = conn != null && conn.m_type != ZDOExtraData.ConnectionType.None;
 
             Vector3 rot = zdo.m_rotation;
-            float rotSq = rot.x * rot.x + rot.y * rot.y + rot.z * rot.z;
-            bool hasRot = !(rotSq < UnityEpsilonSq);
+            bool hasRot = !rot.CloseToZero();
+
+            Vector3 pos = zdo.m_position;
+            bool smallPos;
+            Vector2s packedPos;
+            {
+                var sp = pos.SmallPosition();
+                smallPos = sp.Item1;
+                packedPos = sp.Item2;
+            }
 
             // One read of m_dataFlags replaces three property getters over the same byte.
             int dataFlags = (int)zdo.m_dataFlags;
@@ -100,11 +128,13 @@ namespace AsyncSave.Snapshot
                       | (nBytes   > 0 ? 0x0080 : 0)
                       | ((dataFlags & DataFlagsPersistDistantMask) << 6)   // 4 -> 0x100, 8 -> 0x200
                       | ((dataFlags & DataFlagsTypeMask) << 10)
-                      | (hasRot ? FlagRotation : 0);
+                      | (hasRot ? FlagRotation : 0)
+                      | (smallPos ? FlagSmallPos : 0);
 
-            // Fixed header: 2 flags + 4 sector + 12 position + 4 prefab.
-            int need = MinBytesPerZdo
-                     + (hasRot  ? 12 : 0)
+            // Fixed header: 2 flags + 4 or 12 position + 4 prefab. Rotation is budgeted at its
+            // 4-byte worst case; the 2-byte form just leaves two bytes of the reservation unused.
+            int need = 2 + (smallPos ? 4 : 12) + 4
+                     + (hasRot  ? 4 : 0)
                      + (hasConn ? 5 : 0)
                      + (nFloats > 0 ? 2 + nFloats * 8  : 0)   // key + float
                      + (nVec3s  > 0 ? 2 + nVec3s  * 16 : 0)   // key + 3 floats
@@ -118,9 +148,12 @@ namespace AsyncSave.Snapshot
                 // exceeds 3 bytes per char within the BMP, and a surrogate pair is 4 bytes
                 // for 2 chars, so 3 * Length bounds every string.
                 need += 2 + nStrings * 9;
+                var keys = strings.m_keys;
                 var values = strings.m_values;
-                for (int i = 0; i < nStrings; ++i)
+                int raw = strings.Count;
+                for (int i = 0; i < raw; ++i)
                 {
+                    if (anySession && sessionOnly.Contains(keys[i])) continue;
                     string s = values[i];
                     if (s != null) need += s.Length * 3;
                 }
@@ -128,9 +161,12 @@ namespace AsyncSave.Snapshot
             if (nBytes > 0)
             {
                 need += 2 + nBytes * 8;   // key(4) + length prefix(4)
+                var keys = bytes.m_keys;
                 var values = bytes.m_values;
-                for (int i = 0; i < nBytes; ++i)
+                int raw = bytes.Count;
+                for (int i = 0; i < raw; ++i)
                 {
+                    if (anySession && sessionOnly.Contains(keys[i])) continue;
                     byte[] a = values[i];
                     if (a != null) need += a.Length;
                 }
@@ -151,16 +187,16 @@ namespace AsyncSave.Snapshot
                 byte* p = origin + start;
 
                 *(ushort*)p = (ushort)flags; p += 2;
-                Vector2s sector = zdo.m_sector;
-                *(short*)p = sector.x; p += 2;
-                *(short*)p = sector.y; p += 2;
-                Vector3 pos = zdo.m_position;
-                *(float*)p = pos.x; *(float*)(p + 4) = pos.y; *(float*)(p + 8) = pos.z; p += 12;
-                *(int*)p = zdo.m_prefab; p += 4;
-                if (hasRot)
+                if (smallPos)
                 {
-                    *(float*)p = rot.x; *(float*)(p + 4) = rot.y; *(float*)(p + 8) = rot.z; p += 12;
+                    *(short*)p = packedPos.x; *(short*)(p + 2) = packedPos.y; p += 4;
                 }
+                else
+                {
+                    *(float*)p = pos.x; *(float*)(p + 4) = pos.y; *(float*)(p + 8) = pos.z; p += 12;
+                }
+                *(int*)p = zdo.m_prefab; p += 4;
+                if (hasRot) p = WriteSmallRotation(p, rot);
 
                 if ((flags & FlagAnyExtra) != 0)
                 {
@@ -174,8 +210,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nFloats);
                         var keys = floats.m_keys; var values = floats.m_values;
-                        for (int i = 0; i < nFloats; ++i)
+                        int raw = floats.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i]; *(float*)(p + 4) = values[i]; p += 8;
                         }
                     }
@@ -183,8 +221,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nVec3s);
                         var keys = vec3s.m_keys; var values = vec3s.m_values;
-                        for (int i = 0; i < nVec3s; ++i)
+                        int raw = vec3s.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i];
                             Vector3 v = values[i];
                             *(float*)(p + 4) = v.x; *(float*)(p + 8) = v.y; *(float*)(p + 12) = v.z;
@@ -195,8 +235,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nQuats);
                         var keys = quats.m_keys; var values = quats.m_values;
-                        for (int i = 0; i < nQuats; ++i)
+                        int raw = quats.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i];
                             Quaternion q = values[i];
                             *(float*)(p + 4) = q.x; *(float*)(p + 8) = q.y;
@@ -208,8 +250,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nInts);
                         var keys = ints.m_keys; var values = ints.m_values;
-                        for (int i = 0; i < nInts; ++i)
+                        int raw = ints.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i]; *(int*)(p + 4) = values[i]; p += 8;
                         }
                     }
@@ -217,8 +261,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nLongs);
                         var keys = longs.m_keys; var values = longs.m_values;
-                        for (int i = 0; i < nLongs; ++i)
+                        int raw = longs.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i]; *(long*)(p + 4) = values[i]; p += 12;
                         }
                     }
@@ -226,8 +272,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nStrings);
                         var keys = strings.m_keys; var values = strings.m_values;
-                        for (int i = 0; i < nStrings; ++i)
+                        int raw = strings.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i]; p += 4;
                             p = WriteString(p, values[i] ?? string.Empty);
                         }
@@ -236,8 +284,10 @@ namespace AsyncSave.Snapshot
                     {
                         p = WriteNumItems(p, nBytes);
                         var keys = bytes.m_keys; var values = bytes.m_values;
-                        for (int i = 0; i < nBytes; ++i)
+                        int raw = bytes.Count;
+                        for (int i = 0; i < raw; ++i)
                         {
+                            if (anySession && sessionOnly.Contains(keys[i])) continue;
                             *(int*)p = keys[i]; p += 4;
                             byte[] a = values[i];
                             int len = a != null ? a.Length : 0;
@@ -259,6 +309,49 @@ namespace AsyncSave.Snapshot
                 buf.Position = start + written;
                 return written;
             }
+        }
+
+        /// How many of a section's keys survive the session-only filter. Returns the raw count
+        /// untouched when nothing is registered as session-only, which is the overwhelmingly
+        /// common case and skips the per-key probe entirely.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int Kept<T>(BinarySearchDictionary<int, T> d, HashSet<int> sessionOnly, bool anySession)
+        {
+            if (d == null) return 0;
+            int n = d.Count;
+            if (!anySession || n == 0) return n;
+
+            var keys = d.m_keys;
+            int kept = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                if (!sessionOnly.Contains(keys[i])) ++kept;
+            }
+            return kept;
+        }
+
+        /// ZPackage.WriteSmallRotation. Two forms: a single short when both pitch and roll are
+        /// within half a degree of 0 or 360 (the flat case, which is most placed pieces), and
+        /// otherwise three 10-bit fields packed into a uint and written as two ushorts, high
+        /// half first. That high-half-first order is not a byte-order accident - vanilla writes
+        /// two separate little-endian ushorts - so it has to be reproduced exactly.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static byte* WriteSmallRotation(byte* p, Vector3 v3)
+        {
+            v3 *= 2f;
+            uint x = (uint)v3.x;
+            uint y = (uint)v3.y;
+            uint z = (uint)v3.z;
+            if ((x <= 1 || x >= 719) && (z <= 1 || z >= 719))
+            {
+                y |= 0x8000;
+                *(ushort*)p = (ushort)y;
+                return p + 2;
+            }
+            uint packed = x | (y << 10) | (z << 20);
+            *(ushort*)p = (ushort)(packed >> 16);
+            *(ushort*)(p + 2) = (ushort)packed;
+            return p + 4;
         }
 
         /// ZPackage.WriteNumItems: 1 byte below 128, otherwise 2.

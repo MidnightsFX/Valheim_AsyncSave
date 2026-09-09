@@ -30,7 +30,7 @@ namespace AsyncSave.Patches
                 ProfileSave.ForceSync = true;
 
                 // SaveWorld(true) will invoke our SaveWorldPatch.Prefix which aborts the
-                // pending snapshot and re-runs vanilla PrepareSave/SaveAsync synchronously.
+                // pending snapshot and re-runs vanilla PrepareSave/SaveChunks synchronously.
                 __instance.SaveWorld(true);
             }
         }

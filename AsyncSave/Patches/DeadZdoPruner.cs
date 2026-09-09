@@ -153,10 +153,21 @@ namespace AsyncSave.Patches
             }
         }
 
-        /// ZDOMan.Load clears m_deadZDOs outright (:288); the mirror has to go with it or the
+        /// ZDOMan.Load clears m_deadZDOs outright; the mirror has to go with it or the
         /// queue would carry uids from the previous world.
         [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.Load))]
         internal static class ZdoManLoadPrunerPatch
+        {
+            [HarmonyPostfix]
+            static void Postfix() => Clear();
+        }
+
+        /// The same, for the chunked format. Since the chunked save landed, ZDOMan.Load only
+        /// runs for legacy .db worlds - every world saved by a current game comes in through
+        /// LoadChunks, which clears m_deadZDOs just the same. Hooking only Load left the mirror
+        /// holding the previous world's uids on every modern world load.
+        [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.LoadChunks))]
+        internal static class ZdoManLoadChunksPrunerPatch
         {
             [HarmonyPostfix]
             static void Postfix() => Clear();

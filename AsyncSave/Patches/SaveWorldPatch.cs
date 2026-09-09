@@ -163,18 +163,19 @@ namespace AsyncSave.Patches
             }
         }
 
-        // Vanilla ZNet.SaveWorld runs three PrepareSave calls back to back:
+        // Vanilla ZNet.SaveWorld runs four PrepareSave calls back to back:
         //
-        //   ldarg.0; ldfld m_zdoMan;             callvirt ZDOMan.PrepareSave()
-        //   call ZoneSystem.get_instance();      callvirt ZoneSystem.PrepareSave()
-        //   call RandEventSystem.get_instance(); callvirt RandEventSystem.PrepareSave()
+        //   ldarg.0; ldfld m_zdoMan;                    callvirt ZDOMan.PrepareSave()
+        //   call ZoneSystem.get_instance();             callvirt ZoneSystem.PrepareSave()
+        //   call RandEventSystem.get_instance();        callvirt RandEventSystem.PrepareSave()
+        //   call PersistentEventSystem.get_instance();  callvirt PersistentEventSystem.PrepareSave()
         //
-        // All three are unsliced main-thread work, and the coroutine performs the equivalent
-        // of all three itself at the end of its walk. Bypassing them with one branch that
+        // All four are unsliced main-thread work, and the coroutine performs the equivalent
+        // of all four itself at the end of its walk. Bypassing them with one branch that
         // spans the whole run turns the trigger frame into a thread spawn and nothing else.
         //
-        // One branch rather than three: the receiver for each call is pushed by the
-        // instructions immediately preceding it, so three separate branches would strand
+        // One branch rather than four: the receiver for each call is pushed by the
+        // instructions immediately preceding it, so separate branches would strand
         // those get_instance calls. With a single branch the stack is trivially verifiable -
         // doCustom is only ever reached at depth 1 (the ZDOMan receiver, consumed by
         // AsyncSaveStart) and afterAll only ever at depth 0 from both sides.
@@ -185,19 +186,21 @@ namespace AsyncSave.Patches
             MethodInfo zdoPrepare = AccessTools.DeclaredMethod(typeof(ZDOMan), nameof(ZDOMan.PrepareSave));
             MethodInfo zonePrepare = AccessTools.DeclaredMethod(typeof(ZoneSystem), nameof(ZoneSystem.PrepareSave));
             MethodInfo randPrepare = AccessTools.DeclaredMethod(typeof(RandEventSystem), nameof(RandEventSystem.PrepareSave));
+            MethodInfo persistPrepare = AccessTools.DeclaredMethod(typeof(PersistentEventSystem), nameof(PersistentEventSystem.PrepareSave));
             MethodInfo customStart = AccessTools.DeclaredMethod(typeof(SaveWorldPatch), nameof(AsyncSaveStart));
 
             int iZdo = zdoPrepare == null ? -1 : code.FindIndex(c => c.Calls(zdoPrepare));
             int iZone = (iZdo < 0 || zonePrepare == null) ? -1 : code.FindIndex(iZdo + 1, c => c.Calls(zonePrepare));
             int iRand = (iZone < 0 || randPrepare == null) ? -1 : code.FindIndex(iZone + 1, c => c.Calls(randPrepare));
+            int iLast = (iRand < 0 || persistPrepare == null) ? -1 : code.FindIndex(iRand + 1, c => c.Calls(persistPrepare));
 
-            bool ok = iZdo >= 0 && iZone >= 0 && iRand >= 0 && iRand + 1 < code.Count;
+            bool ok = iZdo >= 0 && iZone >= 0 && iRand >= 0 && iLast >= 0 && iLast + 1 < code.Count;
 
             // Nothing may branch into the region we are about to bypass, or the jump would
             // land mid-region with the wrong stack depth.
             if (ok)
             {
-                for (int i = iZdo; i <= iRand; ++i)
+                for (int i = iZdo; i <= iLast; ++i)
                 {
                     if (code[i].labels.Count > 0) { ok = false; break; }
                 }
@@ -211,9 +214,10 @@ namespace AsyncSave.Patches
                 // what makes ShouldForceSync stop downgrading the manual save.
                 TranspilerFailed = true;
                 SASettings.BlockWorldSave();
-                Log.Error("AsyncSave: could not locate the ZDOMan/ZoneSystem/RandEventSystem PrepareSave " +
-                          "sequence in ZNet.SaveWorld. Async save is disabled; the vanilla save path is " +
-                          "left completely intact. This usually means the game updated.");
+                Log.Error("AsyncSave: could not locate the ZDOMan/ZoneSystem/RandEventSystem/" +
+                          "PersistentEventSystem PrepareSave sequence in ZNet.SaveWorld. Async save is " +
+                          "disabled; the vanilla save path is left completely intact. This usually means " +
+                          "the game updated.");
                 return code;
             }
 
@@ -221,8 +225,8 @@ namespace AsyncSave.Patches
             Label afterAll = il.DefineLabel();
 
             // Tail insert first so iZdo stays valid.
-            code[iRand + 1].labels.Add(afterAll);
-            code.InsertRange(iRand + 1, new[]
+            code[iLast + 1].labels.Add(afterAll);
+            code.InsertRange(iLast + 1, new[]
             {
                 new CodeInstruction(OpCodes.Br, afterAll),
                 new CodeInstruction(OpCodes.Call, customStart) { labels = { doCustom } },
@@ -278,6 +282,7 @@ namespace AsyncSave.Patches
             zdoMan.PrepareSave();
             ZoneSystem.instance.PrepareSave();
             RandEventSystem.instance.PrepareSave();
+            PersistentEventSystem.instance.PrepareSave();
 
             SnapshotState.InProgress = false;
             SnapshotState.ReadyForWrite = false;

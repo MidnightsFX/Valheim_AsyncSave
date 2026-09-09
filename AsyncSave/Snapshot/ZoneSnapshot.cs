@@ -1,14 +1,13 @@
-using UnityEngine;
-
 namespace AsyncSave.Snapshot
 {
     /// Allocation-free stand-in for ZoneSystem.PrepareSave's three clones.
     ///
-    /// Vanilla builds a new HashSet&lt;Vector2i&gt; and a new List&lt;LocationInstance&gt; on every
-    /// save. On a mature world that is a full rehash of every generated zone plus a
-    /// multi-megabyte copy of every location instance, all on the main thread in one frame.
-    /// We copy into pooled arrays instead: HashSet/Dictionary CopyTo are linear slot walks
-    /// with no hashing and, once the arrays have grown to world size, no allocation.
+    /// Vanilla builds a new HashSet&lt;Vector2s&gt;, a new HashSet&lt;string&gt; and a new
+    /// List&lt;LocationInstance&gt; on every save. On a mature world that is a full rehash of every
+    /// generated zone plus a multi-megabyte copy of every location instance, all on the main
+    /// thread in one frame. We copy into pooled arrays instead: HashSet/Dictionary CopyTo are
+    /// linear slot walks with no hashing and, once the arrays have grown to world size, no
+    /// allocation.
     ///
     /// Enumeration order is preserved, which is what keeps the output byte-identical:
     /// vanilla's clone is built by sequential Add over the source's slot order, and CopyTo
@@ -18,7 +17,9 @@ namespace AsyncSave.Snapshot
     /// the world unloads - same policy as the other snapshot pools.
     internal static class ZoneSnapshot
     {
-        public static Vector2i[] Zones = new Vector2i[16384];
+        /// Vector2s since the chunked save format - generated zones are stored as shorts now,
+        /// and the on-disk record shrank with them.
+        public static Vector2s[] Zones = new Vector2s[16384];
         public static int ZoneCount;
 
         public static ZoneSystem.LocationInstance[] Locations = new ZoneSystem.LocationInstance[8192];
@@ -34,10 +35,10 @@ namespace AsyncSave.Snapshot
 
         public static bool LocationsGenerated;
 
-        /// Deliberately separate from SnapshotState.ReadyForWrite. ZoneSystem.SaveASync runs
-        /// after ZDOMan.SaveAsync (ZNet.SaveWorldThread), and that one clears its own flag on
-        /// the way out - sharing a flag would drop the zone write into the vanilla path with
-        /// null m_temp*SaveClone fields and NRE inside vanilla's try/catch.
+        /// Deliberately separate from SnapshotState.ReadyForWrite. ZoneSystem.Save runs after
+        /// ZDOMan.SaveChunks (ZNet.SaveWorldThread), and that one clears its own flag on the way
+        /// out - sharing a flag would drop the zone write into the vanilla path with null
+        /// m_temp*SaveClone fields and NRE inside vanilla's try/catch.
         public static volatile bool Ready;
 
         /// Main thread, no yields - the copy must be atomic with respect to zone generation.
@@ -75,7 +76,7 @@ namespace AsyncSave.Snapshot
         public static void ReleasePools()
         {
             Ready = false;
-            Zones = new Vector2i[16384];
+            Zones = new Vector2s[16384];
             ZoneCount = 0;
             Locations = new ZoneSystem.LocationInstance[8192];
             LocationCount = 0;

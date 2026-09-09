@@ -68,9 +68,14 @@
       <HintPath>$(GamePath)\valheim_Data\Managed\publicized_assemblies\assembly_utils_publicized.dll</HintPath>
       <SpecificVersion>false</SpecificVersion>
     </Reference>
-    <!-- PlatformUserID (map pin authors) lives here. -->
+    <!-- PlatformUserID (map pin authors) and CloudStorageFileGrouping live here. Referenced
+         unpublicized, unlike the assembly_* pair: JotunnBuildTask only publicizes assembly_*,
+         SoftReferenceableAssets and gui_framework, so Splatform_publicized.dll has never
+         existed. The HintPath pointed at it anyway, which resolved to nothing and left only an
+         MSB3245 warning - harmless right up until a method body needed one of those types and
+         the warning became CS0012. Everything we touch here is public in the shipped DLL. -->
     <Reference Include="Splatform">
-      <HintPath>$(GamePath)\valheim_Data\Managed\publicized_assemblies\Splatform_publicized.dll</HintPath>
+      <HintPath>$(GamePath)\valheim_Data\Managed\Splatform.dll</HintPath>
       <SpecificVersion>false</SpecificVersion>
     </Reference>
     <Reference Include="UnityEngine">
@@ -84,42 +89,17 @@
     <Reference Include="System" />
     <Reference Include="System.Core" />
   </ItemGroup>
-  <!-- Wildcard rather than an explicit list. This used to be 30 hand-maintained
-       <Compile Include> lines, and Patches\ZdoRevisionPatches.cs was added to the tree but
-       never to the list: nothing else references it, so it compiled away to nothing and the
-       dirty-reconciliation hooks silently did not exist. The build was green, the mod loaded,
-       and the only symptom was a save that spent 34% of its time proving nothing had changed. -->
+  <!-- Wildcard rather than an explicit list, and this time actually a wildcard. It used to be
+       30 hand-maintained <Compile Include> lines, and Patches\ZdoRevisionPatches.cs was added to
+       the tree but never to the list: nothing else references it, so it compiled away to nothing
+       and the dirty-reconciliation hooks silently did not exist. The build was green, the mod
+       loaded, and the only symptom was a save that spent 34% of its time proving nothing had
+       changed. The comment claiming a wildcard was added; the wildcard was not.
+
+       This is a legacy-format .csproj, so there is no default glob to rely on - the include has
+       to be spelled out. bin/obj are excluded because they hold generated sources. -->
   <ItemGroup>
-    <Compile Include="AsyncSave.cs" />
-    <Compile Include="Config\Settings.cs" />
-    <Compile Include="Patches\DeadZdoPruner.cs" />
-    <Compile Include="Patches\SaveAsyncPatch.cs" />
-    <Compile Include="Patches\SavePlayerProfilePatch.cs" />
-    <Compile Include="Patches\SavePlayerToDiskPatch.cs" />
-    <Compile Include="Patches\SaveWorldPatch.cs" />
-    <Compile Include="Patches\SaveWorldThreadPatch.cs" />
-    <Compile Include="Patches\SectorPatches.cs" />
-    <Compile Include="Patches\ShutdownPatches.cs" />
-    <Compile Include="Patches\StopAllPatch.cs" />
-    <Compile Include="Patches\ZdoRevisionPatches.cs" />
-    <Compile Include="Patches\ZoneSaveAsyncPatch.cs" />
-    <Compile Include="Profile\MapSnapshot.cs" />
-    <Compile Include="Profile\ProfileFormat.cs" />
-    <Compile Include="Profile\ProfileSave.cs" />
-    <Compile Include="Profile\ProfileVerify.cs" />
-    <Compile Include="Profile\SaveIo.cs" />
-    <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="Properties\IgnoresAccessChecksTo.cs" />
-    <Compile Include="Snapshot\SliceBudget.cs" />
-    <Compile Include="Snapshot\SnapshotBuffer.cs" />
-    <Compile Include="Snapshot\SnapshotCoroutine.cs" />
-    <Compile Include="Snapshot\SnapshotState.cs" />
-    <Compile Include="Snapshot\VerifyHarness.cs" />
-    <Compile Include="Snapshot\VisitedSet.cs" />
-    <Compile Include="Snapshot\ZdoSerializer.cs" />
-    <Compile Include="Snapshot\ZoneSnapshot.cs" />
-    <Compile Include="Util\ByteDiff.cs" />
-    <Compile Include="Util\Log.cs" />
+    <Compile Include="**\*.cs" Exclude="bin\**\*.cs;obj\**\*.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Package\CHANGELOG.md" />
