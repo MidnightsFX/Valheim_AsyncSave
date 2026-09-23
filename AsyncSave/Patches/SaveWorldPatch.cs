@@ -22,12 +22,16 @@ namespace AsyncSave.Patches
         public bool WasSync;
         /// The sync flag the original body actually saw.
         public bool Sync;
+        /// The final-save top-up: our snapshot, run to completion, then vanilla's Join.
+        public bool TopUp;
         public long Start;
     }
 
     /// Gate and re-route ZNet.SaveWorld:
     ///  - if the save must complete (shutdown, or the manual save button with async manual
     ///    saves turned off): let vanilla run untouched, aborting any snapshot first
+    ///  - if it is shutdown's save straight after an async final save (FinalSave's top-up):
+    ///    keep the sync flag, and run our snapshot to completion inside the call
     ///  - if it need not complete but the caller asked for sync: downgrade the sync flag so
     ///    vanilla skips its save-thread Join, then take the async branch
     ///  - if snapshot in progress and async arrives: drop the duplicate save
@@ -65,6 +69,17 @@ namespace AsyncSave.Patches
                 return true;
             }
 
+            // The top-up partitions against ZDOMan's settled dirty set, so it is only valid with
+            // no snapshot in flight. The one way to arrive with one is a save that slipped into the
+            // gap between the async final save landing and the quit going through - an admin's
+            // /save, say. That save gets the ordinary shutdown treatment instead: abort the
+            // snapshot and let vanilla do the whole thing. Disarmed before anything below reads
+            // ShouldForceSync, so this call and the transpiled body still agree.
+            if (sync && FinalSave.TopUpArmed && (SnapshotState.InProgress || !SnapshotState.Task.Task.IsCompleted))
+            {
+                FinalSave.DisarmTopUp("a snapshot was already in flight when the shutdown save arrived");
+            }
+
             // Vanilla's tail is `if (!sync) return; m_saveThread.Join();`. On the async path
             // that writer thread is parked in SaveWorldThreadPatch waiting on a TCS only the
             // main-thread snapshot coroutine can complete - and the main thread would be sitting
@@ -76,7 +91,12 @@ namespace AsyncSave.Patches
             //
             // Written through `ref` so the transpiled body reads the same value we decided on
             // here - ShouldForceSync is called from both, and they must never disagree.
-            if (sync && !ShouldForceSync(sync)) sync = false;
+            //
+            // The top-up is the one save that takes our branch and keeps its flag. It can:
+            // AsyncSaveStart finishes the whole snapshot before the writer thread even exists,
+            // so the Join has nothing to wait on but the write.
+            bool topUp = sync && FinalSave.TopUpArmed && !ShouldForceSync(sync);
+            if (sync && !ShouldForceSync(sync) && !topUp) sync = false;
 
             // ZNet.SaveWorld opens with `if (m_saveThread.IsAlive) m_saveThread.Join()` - an
             // unbounded main-thread block waiting on a background thread that is streaming a
@@ -108,13 +128,15 @@ namespace AsyncSave.Patches
             {
                 __state.Ran = true;
                 __state.Sync = sync;
+                __state.TopUp = topUp;
                 return true;
             }
 
-            // A save that must complete arrives mid-snapshot. After the downgrade above,
-            // ShouldForceSync is true exactly when sync survived it, so shutdown saves and
-            // config-disabled manual saves share one branch: abort our coroutine, then reset
-            // the TCS to completed-true so the fresh vanilla SaveWorldThread proceeds.
+            // A save that must complete arrives mid-snapshot. After the downgrade above - and with
+            // any top-up disarmed at the top, since this path never has one - ShouldForceSync is
+            // true exactly when sync survived it, so shutdown saves and config-disabled manual
+            // saves share one branch: abort our coroutine, then reset the TCS to completed-true
+            // so the fresh vanilla SaveWorldThread proceeds.
             if (ShouldForceSync(sync))
             {
                 SnapshotCoroutine.Abort(ProfileSave.ForceSync
@@ -147,7 +169,12 @@ namespace AsyncSave.Patches
             bool notable = __state.WasSync || ms >= MainThreadLogThresholdMs;
             if (log == SALogLevel.Simple && !notable) return;
 
-            if (__state.Sync)
+            if (__state.TopUp)
+            {
+                Log.Info($"AsyncSave: ZNet.SaveWorld blocked the main thread for {ms:0.0} ms " +
+                         "(final save top-up: snapshot run to completion + save thread Join).");
+            }
+            else if (__state.Sync)
             {
                 Log.Info($"AsyncSave: ZNet.SaveWorld blocked the main thread for {ms:0.0} ms " +
                          "(sync path: vanilla PrepareSave + save thread Join).");
@@ -177,8 +204,9 @@ namespace AsyncSave.Patches
         // One branch rather than four: the receiver for each call is pushed by the
         // instructions immediately preceding it, so separate branches would strand
         // those get_instance calls. With a single branch the stack is trivially verifiable -
-        // doCustom is only ever reached at depth 1 (the ZDOMan receiver, consumed by
-        // AsyncSaveStart) and afterAll only ever at depth 0 from both sides.
+        // doCustom is only ever reached at depth 1 (the ZDOMan receiver, which AsyncSaveStart
+        // consumes along with the sync flag pushed after it) and afterAll only ever at depth 0
+        // from both sides.
         static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator il)
         {
             var code = new List<CodeInstruction>(instructions);
@@ -229,7 +257,8 @@ namespace AsyncSave.Patches
             code.InsertRange(iLast + 1, new[]
             {
                 new CodeInstruction(OpCodes.Br, afterAll),
-                new CodeInstruction(OpCodes.Call, customStart) { labels = { doCustom } },
+                new CodeInstruction(OpCodes.Ldarg_1) { labels = { doCustom } },   // sync
+                new CodeInstruction(OpCodes.Call, customStart),
             });
 
             MethodInfo shouldForceSync = AccessTools.DeclaredMethod(typeof(SaveWorldPatch), nameof(ShouldForceSync));
@@ -248,13 +277,13 @@ namespace AsyncSave.Patches
         }
 
         /// Determine whether this save should take the synchronous vanilla path.
-        /// Autosaves are never forced. Shutdown saves are always forced. The only other caller
-        /// that passes sync is Menu.OnManualSave, which honours the AsyncManualSave config
-        /// switch. Called from both Prefix and transpiled IL, which must agree.
+        /// Autosaves are never forced. Shutdown saves are always forced, except the final-save
+        /// top-up, which takes our path run to completion. The only other caller that passes sync
+        /// is Menu.OnManualSave, which honours the AsyncManualSave config switch. Called from both
+        /// Prefix and transpiled IL, which must agree.
         public static bool ShouldForceSync(bool sync)
         {
             if (!sync) return false; // autosave -> never force
-            if (ProfileSave.ForceSync) return true; // shutdown -> force
 
             // With the world save off there is no coroutine to wait on, so there is nothing to
             // gain by dropping vanilla's save-thread Join - and a lot to lose: the kill switch is
@@ -263,17 +292,33 @@ namespace AsyncSave.Patches
             // because the sync downgrade in Prefix happens before the branch that reaches it.
             if (!SASettings.WorldSaveOn) return true;
 
+            if (FinalSave.TopUpArmed) return false; // shutdown after an async final save -> top-up
+            if (ProfileSave.ForceSync) return true; // shutdown -> force
+
             return !SASettings.AsyncManualSave.Value; // manual save -> honour config
         }
 
         // Called from transpiled ZNet.SaveWorld when the sync flag is not forcing vanilla path.
         // Consumes the ZDOMan instance that was already pushed onto the stack
-        // (it would have been the receiver for PrepareSave).
-        public static void AsyncSaveStart(ZDOMan zdoMan)
+        // (it would have been the receiver for PrepareSave), and the sync flag as Prefix left it.
+        public static void AsyncSaveStart(ZDOMan zdoMan, bool sync)
         {
             if (SASettings.WorldSaveOn)
             {
-                SnapshotCoroutine.Start(zdoMan);
+                // Still set here means vanilla's tail is about to Join the writer this call
+                // starts, so the snapshot has to be finished before we return: a coroutine would
+                // park that writer on a walk the blocked main thread can never advance - the
+                // manual-save deadlock again. Prefix downgrades every other sync save that
+                // reaches this branch; only the final-save top-up keeps the flag.
+                if (sync)
+                {
+                    FinalSave.DisarmTopUp(null);
+                    SnapshotCoroutine.RunToCompletion(zdoMan);
+                }
+                else
+                {
+                    SnapshotCoroutine.Start(zdoMan);
+                }
                 return;
             }
 

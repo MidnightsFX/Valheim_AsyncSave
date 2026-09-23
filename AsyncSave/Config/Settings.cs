@@ -33,6 +33,7 @@ namespace AsyncSave.Config
         // 2 - World Save (server side; a client never runs the world save at all)
         public static ConfigEntry<bool> WorldSaveEnabled;
         public static ConfigEntry<bool> AsyncManualSave;
+        public static ConfigEntry<bool> AsyncFinalSave;
         public static ConfigEntry<int> SliceBudgetMs;
         public static ConfigEntry<bool> AdaptiveBudget;
         public static ConfigEntry<int> FrameHeadroomPercent;
@@ -131,7 +132,20 @@ namespace AsyncSave.Config
                 "takes in single-player, or on a host with no connected players). Turn this off to " +
                 "have the Save button block until the world is on disk. The /save console command " +
                 "is already asynchronous in vanilla and is unaffected either way. Shutdown, logout " +
-                "and quit always save synchronously regardless of this setting.");
+                "and quit are not affected by this setting - see 'Async final save'.");
+
+            AsyncFinalSave = cfg.Bind(
+                "2 - World Save", "Async final save", false,
+                "Run the last world save of a session - logout, quit, or stopping a server - on the " +
+                "async path, and hold the logout or quit until it has landed. The game keeps drawing " +
+                "frames while it saves instead of freezing on vanilla's final save, which on a large " +
+                "world is the longest stall of the session. Whatever changed while that save was " +
+                "being written is caught by a short final pass once shutdown begins, so nothing is " +
+                "lost. The save runs flat out rather than at the slice budget. Off leaves the final " +
+                "save exactly as vanilla does it, and so does any shutdown that does not go through " +
+                "Unity's quit request. On a dedicated server, anything that kills the process on a " +
+                "timer - a service manager's or container's stop timeout, or Windows closing a " +
+                "console window - needs room for a full world save, as it does in vanilla.");
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,

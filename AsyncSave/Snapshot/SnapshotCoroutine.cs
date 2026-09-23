@@ -51,10 +51,45 @@ namespace AsyncSave.Snapshot
             SnapshotState.ResetForNewSnapshot();
             SnapshotState.InProgress = true;
 
-            _current = ZNet.instance.StartCoroutine(Guarded(Run(zdoMan, tcs), tcs));
+            _current = ZNet.instance.StartCoroutine(Guarded(Run(zdoMan, tcs, false), tcs));
 
             _triggerFrameMs = (Stopwatch.GetTimestamp() - t0) * 1000f / Stopwatch.Frequency;
             return tcs.Task;
+        }
+
+        /// Run a whole snapshot inside the calling frame and return with it published, for a save
+        /// that vanilla is about to Join. Only the final-save top-up comes here (see FinalSave): it
+        /// follows an async save that already carried the bulk of the world, so what is left is
+        /// whatever was dirtied while that one ran. Doing that in one block makes the file on disk
+        /// the world as it stood when shutdown began - the guarantee vanilla's own final save
+        /// gives - without vanilla's ZDOExtraData.PrepareSave deep clone of every ZDO.
+        ///
+        /// The same walk as the async path, unsliced the way the verify harness runs it, and
+        /// driven by hand rather than by a coroutine so there is one walk to keep correct. A
+        /// failure falls back through Guarded exactly as the async path does.
+        public static void RunToCompletion(ZDOMan zdoMan)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+
+            // ZNet.SaveWorld has just joined the previous writer, but ZDOMan only applies that
+            // writer's EndSave on its next Update - which on the shutdown path never comes. Until
+            // it does, slot 0 still lists the chunks that save already wrote and everything since
+            // sits in slot 1, where ChunkPartition does not look. Apply it now. Then fold back any
+            // save that began and never ended (a writer that bailed before EndSave), which can
+            // only widen the chunk set, never lose from it.
+            zdoMan.UpdateSaveState();
+            RollbackSaveState(zdoMan);
+
+            var tcs = new TaskCompletionSource<bool>();
+            SnapshotState.Task = tcs;
+            SnapshotState.ResetForNewSnapshot();
+            SnapshotState.InProgress = true;
+            _triggerFrameMs = (Stopwatch.GetTimestamp() - t0) * 1000f / Stopwatch.Frequency;
+
+            // Unsliced, the walk never yields, so this is a single MoveNext in practice. Looping
+            // anyway costs nothing and does not depend on that staying true.
+            var walk = Guarded(Run(zdoMan, tcs, true), tcs);
+            while (walk.MoveNext()) { }
         }
 
         /// Runs the walk so that it fails closed.
@@ -175,11 +210,11 @@ namespace AsyncSave.Snapshot
             Log.Info($"AsyncSave snapshot aborted: {reason}");
         }
 
-        private static IEnumerator Run(ZDOMan zdoMan, TaskCompletionSource<bool> tcs)
+        private static IEnumerator Run(ZDOMan zdoMan, TaskCompletionSource<bool> tcs, bool runToCompletion)
         {
             // One frame of settle time before we start walking; lets the initial patch-triggered
-            // path finish stack unwind cleanly.
-            yield return null;
+            // path finish stack unwind cleanly. A run to completion has no frame to give.
+            if (!runToCompletion) yield return null;
 
             var log = SASettings.Logging.Value;
             bool timings = SASettings.LogTimings;
@@ -201,6 +236,10 @@ namespace AsyncSave.Snapshot
             bool verify = false;
 #endif
 
+            // Verify needs one un-yielded slice for byte-identity; a run to completion needs one
+            // because there is no next frame to yield to. Same mechanism either way.
+            bool unsliced = verify || runToCompletion;
+
             int budgetMs = SASettings.SliceBudgetMs.Value;
             bool adaptive = SASettings.AdaptiveBudget.Value;
             float headroom = SASettings.FrameHeadroomPercent.Value / 100f;
@@ -210,7 +249,7 @@ namespace AsyncSave.Snapshot
             // figure covers every millisecond this coroutine holds the main thread - the rebuild
             // shares a frame with the first slice, and a metric that excludes it would understate
             // what the player actually feels.
-            var slice = SliceBudget.Create(budgetMs, adaptive, headroom, verify);
+            var slice = SliceBudget.Create(budgetMs, adaptive, headroom, unsliced);
 
             // Rebuild connection hash data from live connections. O(connections), unsliced:
             // it has to be atomic with respect to live connections.
@@ -267,20 +306,20 @@ namespace AsyncSave.Snapshot
             //
             // A frame between them, because together they can be gigabytes of fresh LOH and one
             // block holding all of it is exactly the kind of spike the slice budget cannot see.
-            // Verify mode keeps its single un-yielded slice - see above.
+            // An unsliced walk keeps its single un-yielded slice - see above.
             int expectedZdos = EstimateZdoCount(zdoMan, selectedZdos, writePortalChunk);
 
             SnapshotState.Visited.EnsureCapacity(expectedZdos);
-            if (!verify) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
+            if (!unsliced) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
 
             SnapshotState.EnsureEntryCapacity(expectedZdos);
-            if (!verify) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
+            if (!unsliced) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
 
             // 15% over the measured density, so the walk normally never has to add a block. double
             // rather than float: at 48 M ZDOs the product is past where float keeps whole numbers.
             long wantBytes = (long)(expectedZdos * (double)SnapshotState.BytesPerZdoEma * 1.15);
             SnapshotState.Buffer.EnsureCapacity(wantBytes);
-            if (!verify) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
+            if (!unsliced) { slice.EndSlice(); yield return null; slice.BeginSlice(); }
 
             long presizeMs = totalStopwatch.ElapsedMilliseconds - connMs;
 

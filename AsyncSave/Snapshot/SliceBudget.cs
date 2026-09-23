@@ -41,8 +41,26 @@ namespace AsyncSave.Snapshot
         /// save out.
         private const int MaxPerSlice = 50000;
 
+        /// Set while a logout or quit is being held for the world save (see FinalSave). Nobody is
+        /// playing through that save - the player asked to leave and is waiting on it - so frame
+        /// pacing stops mattering and the only thing still worth protecting is the window's
+        /// message pump. Each slice then gets RushBudgetMs, with the adaptive rule and the
+        /// per-slice cap stood down: at a few hundred nanoseconds a ZDO the cap would trip at
+        /// well under half the rush budget.
+        ///
+        /// Checked at the start of every slice, not just at Create, so it also hurries a walk
+        /// that was already running at autosave pace when the logout arrived. Latches for the
+        /// rest of that walk.
+        public static bool Rush;
+
+        /// Most of each frame goes to the walk while the window still pumps well over ten times a
+        /// second - nowhere near the seconds Windows waits before calling a window unresponsive.
+        private const float RushBudgetMs = 50f;
+
         private long _budgetTicks;
         private int _maxPerSlice;
+        private bool _unsliced;
+        private bool _rushed;
         private int _inSlice;
         private long _sliceStart;
         private long _worstTicks;
@@ -69,10 +87,11 @@ namespace AsyncSave.Snapshot
 
             float capTarget = DetectTargetFrameMs();
 
-            return new SliceBudget
+            var slice = new SliceBudget
             {
                 _budgetTicks = ticks,
                 _maxPerSlice = unsliced ? int.MaxValue : MaxPerSlice,
+                _unsliced = unsliced,
                 _sliceStart = Stopwatch.GetTimestamp(),
                 _adaptive = adaptive && !unsliced,
                 _maxBudgetMs = budgetMs,
@@ -83,6 +102,20 @@ namespace AsyncSave.Snapshot
                 _lastBudgetMs = budgetMs,
                 _ticksPerMs = Stopwatch.Frequency / 1000f,
             };
+            if (Rush) slice.ApplyRush();
+            return slice;
+        }
+
+        /// Switch to the rush budget for the rest of this walk. An unsliced walk already has no
+        /// budget to raise.
+        private void ApplyRush()
+        {
+            if (_unsliced || _rushed) return;
+            _rushed = true;
+            _adaptive = false;
+            _maxPerSlice = int.MaxValue;
+            _budgetTicks = (long)(RushBudgetMs * _ticksPerMs);
+            _lastBudgetMs = RushBudgetMs;
         }
 
         /// Count one processed object. Returns true when the current slice should end.
@@ -107,6 +140,8 @@ namespace AsyncSave.Snapshot
 
         public void BeginSlice()
         {
+            if (Rush) ApplyRush();
+
             if (_adaptive)
             {
                 // Time.unscaledDeltaTime, read from a coroutine that just resumed, is the

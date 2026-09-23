@@ -14,13 +14,21 @@ namespace AsyncSave
     {
         public const string PluginGUID = "MidnightsFX.AsyncSave";
         public const string PluginName = "AsyncSave";
-        public const string PluginVersion = "0.5.0";
+        public const string PluginVersion = "0.6.0";
 
         private Harmony _harmony;
+
+        /// Set when the game quits. Unpatching is for unloading the mod from a running game (a
+        /// script-engine reload). On quit it would rebuild every patched method one patch at a
+        /// time, re-running every other mod's transpilers against a game that is being torn
+        /// down, and those can throw.
+        private static bool _quitting;
 
         public void Awake()
         {
             Log.Source = Logger;
+            UnityEngine.Application.quitting += OnQuitting;
+            UnityEngine.Application.wantsToQuit += FinalSave.OnWantsToQuit;
             SASettings.Bind(Config);
 
             // The ZDO serializer writes multi-byte values through raw pointers, so it inherits
@@ -107,19 +115,29 @@ namespace AsyncSave
             missing = missing == null ? label : missing + " and " + label;
         }
 
-        /// Main-thread completion pump for the character-save pipeline, and the dead-ZDO
-        /// expiry pass. BaseUnityPlugin is already a MonoBehaviour and outlives scene loads, so
-        /// these need no patch of their own.
+        /// Main-thread completion pump for the character-save pipeline, the dead-ZDO expiry
+        /// pass, and a logout or quit held for the final save. BaseUnityPlugin is already a
+        /// MonoBehaviour and outlives scene loads, so these need no patch of their own.
         public void Update()
         {
             ProfileSave.Pump();
             DeadZdoPruner.Pump();
+            FinalSave.Pump();
         }
+
+        private static void OnQuitting() => _quitting = true;
 
         public void OnDestroy()
         {
+            // Pending saves are flushed whether or not the game is quitting.
             ProfileSave.DrainToDisk();
             SaveIo.Stop();
+
+            // Nothing to unpatch for a process that is exiting.
+            if (_quitting) return;
+
+            UnityEngine.Application.quitting -= OnQuitting;
+            UnityEngine.Application.wantsToQuit -= FinalSave.OnWantsToQuit;
             _harmony?.UnpatchSelf();
         }
     }

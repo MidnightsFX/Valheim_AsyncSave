@@ -16,6 +16,10 @@ namespace AsyncSave.Patches
         {
             if (__instance.m_haveStoped) return;
 
+            // The world is going away. Shutdown's save, top-up included, has already run by now;
+            // and the save below must be the vanilla one its comment promises, not a top-up.
+            FinalSave.Reset();
+
             // Land any character save before the scene goes away.
             ProfileSave.DrainToDisk();
 

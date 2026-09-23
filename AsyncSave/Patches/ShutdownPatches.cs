@@ -8,7 +8,8 @@ namespace AsyncSave.Patches
     /// Game.Shutdown calls SavePlayerProfile(true) and then immediately tears down ZNetScene,
     /// ZNet and the scene itself; OnApplicationQuit only sleeps 2000 ms. Nothing here may be
     /// deferred to a later frame, because there will not be one - so we land any in-flight save
-    /// and then let vanilla run the whole thing synchronously.
+    /// and then let vanilla run the whole thing synchronously. (FinalSave is what gets the world
+    /// save onto the async path anyway: it runs before any of this starts.)
     internal static class ShutdownPatches
     {
         /// Shutdown latches ForceSync, but quitting to the main menu and then starting another
@@ -21,6 +22,7 @@ namespace AsyncSave.Patches
             {
                 ProfileSave.ForceSync = false;
                 ProfileSave.Reset();
+                FinalSave.Reset();
             }
         }
 
@@ -29,6 +31,7 @@ namespace AsyncSave.Patches
         {
             static void Prefix()
             {
+                FinalSave.OnShutdownStarted();
                 ProfileSave.DrainToDisk();
                 ProfileSave.ForceSync = true;
             }

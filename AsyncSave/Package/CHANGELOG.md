@@ -1,3 +1,9 @@
+**0.6.0**
+---
+```
+Adds support to enable Async save running the final shutdown save. This can prevent crashes during shutdown for servers which have large ZDO counts
+```
+
 **0.5.0**
 ---
 ```
