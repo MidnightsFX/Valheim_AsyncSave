@@ -28,7 +28,6 @@ namespace AsyncSave
         {
             Log.Source = Logger;
             UnityEngine.Application.quitting += OnQuitting;
-            UnityEngine.Application.wantsToQuit += FinalSave.OnWantsToQuit;
             SASettings.Bind(Config);
 
             // The ZDO serializer writes multi-byte values through raw pointers, so it inherits
@@ -137,7 +136,6 @@ namespace AsyncSave
             if (_quitting) return;
 
             UnityEngine.Application.quitting -= OnQuitting;
-            UnityEngine.Application.wantsToQuit -= FinalSave.OnWantsToQuit;
             _harmony?.UnpatchSelf();
         }
     }

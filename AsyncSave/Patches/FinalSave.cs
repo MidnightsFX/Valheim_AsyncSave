@@ -8,28 +8,28 @@ using SALogLevel = AsyncSave.Config.LogLevel;
 
 namespace AsyncSave.Patches
 {
-    /// Runs the last world save of a session on the async path, and holds the logout or quit
-    /// until it has landed.
+    /// Takes the last world save of a session off vanilla's path.
     ///
-    /// Vanilla's final save happens inside Game.Shutdown, after ZNetScene has been torn down and
-    /// with no later frame to run a coroutine on, so ShutdownPatches has to leave it to vanilla -
-    /// and on a large world that is the longest freeze of the session: ZDOExtraData.PrepareSave
-    /// deep-clones every ZDO in the world, then the main thread Joins the writer. This gets in
-    /// before shutdown starts instead. Logout (Game.ContinueLogout) and quit
-    /// (Application.wantsToQuit) are held, the ordinary async save runs while the game keeps
-    /// pumping frames, and once its writer has finished the held action is let through and
-    /// shutdown runs exactly as vanilla wrote it.
+    /// Vanilla's final save happens inside Game.Shutdown, and on a large world it is the longest
+    /// freeze of the session: ZDOExtraData.PrepareSave deep-clones every ZDO in the world, then
+    /// the main thread Joins the writer. With the option on, that save - whatever triggered the
+    /// shutdown - goes through our serializer instead (OwnsShutdownSave; SaveWorldPatch routes
+    /// it). There is no later frame to spread it over by then, so it runs to completion inside
+    /// the call. That alone is what a dedicated server gets: its stop arrives through Unity's
+    /// quit, which cannot be held (see below), and nobody is watching its frames anyway.
     ///
-    /// That leaves a window: the async save captured the world as of the end of its walk, and
-    /// the game kept running while the writer wrote. Shutdown's own sync save still closes it.
-    /// With the top-up armed, SaveWorldPatch sends that one through our serializer run to
-    /// completion inside the call, so it only has to cover the chunks dirtied since the async
-    /// save began, and skips the whole-world ZDOExtraData clone. The file on disk is then the
-    /// world as it stood when shutdown began - the same guarantee vanilla's final save gives.
+    /// The menu's Logout (Game.ContinueLogout) and Quit (Menu.QuitGame) go one better, because
+    /// they can be held before shutdown starts. The ordinary async save runs while the game keeps
+    /// pumping frames, and once its writer has finished the held action is replayed. Shutdown's
+    /// own save then only has the chunks dirtied since that async save began, so the block the
+    /// player sees shrinks to the last few seconds of changes. The file on disk is the world as it
+    /// stood when shutdown began either way - the same guarantee vanilla's final save gives.
     ///
-    /// Anything that reaches shutdown without passing through here - a quit that never raises
-    /// wantsToQuit, the timeout below, the option being off - gets vanilla's final save, as
-    /// before.
+    /// Quit is held at the menu, before Application.Quit is ever called, and never through
+    /// Application.wantsToQuit. Once Unity's quit has started, cancelling it there does not stop
+    /// OnApplicationQuit on this Unity version: Game shut the world down anyway, the quit stayed
+    /// cancelled, and the process was left running a dead game on a black screen. So nothing here
+    /// may ever cancel a quit Unity has begun.
     internal static class FinalSave
     {
         private enum Held
@@ -40,9 +40,9 @@ namespace AsyncSave.Patches
         }
 
         /// Give up holding after this long and let shutdown run. The save is not abandoned:
-        /// shutdown's own save then takes the vanilla way, which aborts a walk still in progress
-        /// or Joins a writer still writing. This is for a walk that has stopped advancing, not
-        /// a slow disk - the writer's time is spent either way.
+        /// shutdown's own save aborts a walk still in progress and redoes it in one block, or
+        /// Joins a writer still writing. This is for a walk that has stopped advancing, not a
+        /// slow disk - the writer's time is spent either way.
         private const double TimeoutSeconds = 300.0;
 
         /// How often the on-screen notice is re-shown. A center message fades after a few
@@ -58,25 +58,21 @@ namespace AsyncSave.Patches
         private static bool _shouldExit;
         private static bool _changeToStartScene;
 
-        /// True while we re-issue a held logout, so our own ContinueLogout prefix lets it by.
+        /// True while we replay a held action, so our own prefixes let it by.
         private static bool _releasing;
 
-        /// Set once a held quit has been released. Every quit request from then on goes
-        /// straight through, including the one we just issued.
-        private static bool _quitReleased;
-
-        /// Shutdown's save is the top-up. Set on release, consumed by SaveWorldPatch.
-        public static bool TopUpArmed { get; private set; }
-
-        /// Stand the top-up down. `reason` is logged; null means it was consumed.
-        public static void DisarmTopUp(string reason)
+        /// A sync save now is shutdown's save, and ours to take. Game.Shutdown raises
+        /// IsShuttingDown before it saves anything, and every way the game stops - logout, quit,
+        /// a server told to stop, the window closing - passes through there. Read by
+        /// SaveWorldPatch from both its prefix and the transpiled body, so it must not change
+        /// between the two within one save; nothing here does.
+        public static bool OwnsShutdownSave
         {
-            if (!TopUpArmed) return;
-            TopUpArmed = false;
-            if (reason != null)
+            get
             {
-                Log.Warn($"AsyncSave: final save top-up stood down ({reason}); shutdown's save takes " +
-                         "the vanilla path.");
+                if (!SASettings.AsyncFinalSave.Value) return false;
+                var game = Game.instance;
+                return game != null && game.IsShuttingDown();
             }
         }
 
@@ -85,63 +81,18 @@ namespace AsyncSave.Patches
         {
             _held = Held.None;
             _clock.Reset();
-            _quitReleased = false;
-            TopUpArmed = false;
             SliceBudget.Rush = false;
         }
 
-        /// Game.Shutdown has begun. If we are still holding, something shut the game down around
-        /// us - a quit that never raised wantsToQuit - and there is nothing left to release.
-        /// The top-up stays unarmed, so that shutdown's save goes the vanilla way.
+        /// Game.Shutdown has begun. If we are still holding, the game was shut down around us -
+        /// the window closed, most likely - and there is nothing left to release. Shutdown's own
+        /// save still takes our path, it just has the whole of it to do in one block.
         public static void OnShutdownStarted()
         {
             if (_held == Held.None) return;
             Log.Warn("AsyncSave: the game shut down while the async final save was still running; " +
-                     "vanilla's final save takes over.");
+                     "the shutdown save will finish it in one pass.");
             Unhold();
-        }
-
-        /// Application.wantsToQuit handler. Returning false cancels the quit. Never throws: an
-        /// exception here must not leave a game that cannot be quit.
-        public static bool OnWantsToQuit()
-        {
-            try
-            {
-                if (_quitReleased) return true;
-
-                if (_held != Held.None)
-                {
-                    // A stuck hold must not become a game that cannot be closed.
-                    if (_clock.Elapsed.TotalSeconds > TimeoutSeconds) return true;
-
-                    // Repeats are expected, not impatience - ServerCtrl re-issues Application.Quit
-                    // every two seconds for as long as server_exit.drp exists - so none of them
-                    // may cut the save short. A quit outranks a held logout, though: release as
-                    // one.
-                    if (_held == Held.Logout)
-                    {
-                        _held = Held.Quit;
-                        Log.Info("AsyncSave: quit requested while holding a logout; the game will quit " +
-                                 "once the final save lands.");
-                    }
-                    return false;
-                }
-
-                if (!CanRun()) return true;
-
-                // Game.OnApplicationQuit asks this too, and quits without saving the world when it
-                // fails. Holding the quit for a save vanilla would not have made helps nobody.
-                if (!ZNet.instance.EnoughDiskSpaceAvailable(out bool _)) return true;
-
-                Hold(Held.Quit);
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Log.Error($"AsyncSave: async final save could not hold the quit, letting it through. {ex}");
-                Unhold();
-                return true;
-            }
         }
 
         /// Main thread, once per frame, from AsyncSavePlugin.Update.
@@ -159,16 +110,12 @@ namespace AsyncSave.Patches
             if (timedOut)
             {
                 Log.Error($"AsyncSave: the async final save did not finish within {TimeoutSeconds:0} s. " +
-                          "Letting shutdown continue; its own save takes the vanilla path.");
+                          "Letting shutdown continue; its own save will redo it in one pass.");
             }
-            else
+            else if (SASettings.Logging.Value != SALogLevel.Off)
             {
-                TopUpArmed = true;
-                if (SASettings.Logging.Value != SALogLevel.Off)
-                {
-                    Log.Info($"AsyncSave: async final save landed after {_clock.Elapsed.TotalSeconds:0.0} s; " +
-                             "continuing shutdown.");
-                }
+                Log.Info($"AsyncSave: async final save landed after {_clock.Elapsed.TotalSeconds:0.0} s; " +
+                         "continuing shutdown.");
             }
 
             Release();
@@ -241,8 +188,8 @@ namespace AsyncSave.Patches
             SliceBudget.Rush = false;
         }
 
-        /// Cosmetic and best-effort: a dedicated server has no Hud, and nothing depends on this
-        /// landing - so nothing it throws may reach the hold.
+        /// Cosmetic and best-effort: nothing depends on this landing, so nothing it throws may
+        /// reach the hold.
         private static void ShowNotice()
         {
             double now = _clock.Elapsed.TotalSeconds;
@@ -260,8 +207,8 @@ namespace AsyncSave.Patches
             }
         }
 
-        /// Let the held action through. Unheld first, so whatever the action throws - it is
-        /// vanilla shutdown from here - can never leave us holding, or have us issue it twice.
+        /// Replay the held action. Unheld first, so whatever the action throws - it is vanilla
+        /// shutdown from here - can never leave us holding, or have us replay it twice.
         private static void Release()
         {
             var held = _held;
@@ -269,17 +216,24 @@ namespace AsyncSave.Patches
 
             if (held == Held.Quit)
             {
-                _quitReleased = true;
-                UnityEngine.Application.Quit();
+                // Through Menu.QuitGame rather than straight to Application.Quit, so anything else
+                // patched onto the menu's quit still sees it.
+                var menu = Menu.instance;
+                _releasing = true;
+                try
+                {
+                    if (menu != null) menu.QuitGame();
+                    else UnityEngine.Application.Quit();
+                }
+                finally
+                {
+                    _releasing = false;
+                }
                 return;
             }
 
             var game = Game.instance;
-            if (game == null || game.IsShuttingDown())
-            {
-                DisarmTopUp(null);
-                return;
-            }
+            if (game == null || game.IsShuttingDown()) return;
 
             _releasing = true;
             try
@@ -289,9 +243,6 @@ namespace AsyncSave.Patches
             finally
             {
                 _releasing = false;
-                // Logout is synchronous: by now shutdown's save has either used the top-up or
-                // was never going to run.
-                DisarmTopUp(null);
             }
         }
 
@@ -321,6 +272,48 @@ namespace AsyncSave.Patches
                 catch (Exception ex)
                 {
                     Log.Error($"AsyncSave: async final save could not hold the logout, letting it through. {ex}");
+                    Unhold();
+                    return true;
+                }
+            }
+        }
+
+        /// The menu's Quit, after its disk-space and cloud-storage prompts have had their say,
+        /// and before Application.Quit - the last point at which holding is still safe.
+        [HarmonyPatch(typeof(Menu), nameof(Menu.QuitGame))]
+        internal static class MenuQuitGame
+        {
+            static bool Prefix()
+            {
+                if (_releasing) return true;
+
+                try
+                {
+                    if (_held != Held.None)
+                    {
+                        // A quit outranks a held logout: replay as a quit instead.
+                        if (_held == Held.Logout)
+                        {
+                            _held = Held.Quit;
+                            Log.Info("AsyncSave: quit requested while holding a logout; the game will " +
+                                     "quit once the final save lands.");
+                        }
+                        return false;
+                    }
+
+                    if (!CanRun()) return true;
+
+                    // Game.OnApplicationQuit asks this too, and quits without saving the world
+                    // when it fails. Holding the quit for a save vanilla would not have made
+                    // helps nobody.
+                    if (!ZNet.instance.EnoughDiskSpaceAvailable(out bool _)) return true;
+
+                    Hold(Held.Quit);
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"AsyncSave: async final save could not hold the quit, letting it through. {ex}");
                     Unhold();
                     return true;
                 }

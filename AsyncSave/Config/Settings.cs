@@ -136,16 +136,14 @@ namespace AsyncSave.Config
 
             AsyncFinalSave = cfg.Bind(
                 "2 - World Save", "Async final save", false,
-                "Run the last world save of a session - logout, quit, or stopping a server - on the " +
-                "async path, and hold the logout or quit until it has landed. The game keeps drawing " +
-                "frames while it saves instead of freezing on vanilla's final save, which on a large " +
-                "world is the longest stall of the session. Whatever changed while that save was " +
-                "being written is caught by a short final pass once shutdown begins, so nothing is " +
-                "lost. The save runs flat out rather than at the slice budget. Off leaves the final " +
-                "save exactly as vanilla does it, and so does any shutdown that does not go through " +
-                "Unity's quit request. On a dedicated server, anything that kills the process on a " +
-                "timer - a service manager's or container's stop timeout, or Windows closing a " +
-                "console window - needs room for a full world save, as it does in vanilla.");
+                "Take the world save made at shutdown - logout, quit, or stopping a server - through " +
+                "this mod's serializer instead of vanilla's, which first deep-clones every object in " +
+                "the world. From the menu's Logout and Quit, the logout or quit is held while an " +
+                "async save runs flat out with the game still drawing frames, and goes ahead once it " +
+                "has landed; a short final pass then catches whatever changed meanwhile. Any other " +
+                "shutdown - a dedicated server being stopped, the window being closed - cannot be " +
+                "held, so the save runs start to finish inside the shutdown, where vanilla's would " +
+                "have. Off leaves the final save exactly as vanilla does it.");
 
             SliceBudgetMs = cfg.Bind(
                 "2 - World Save", "Slice budget (ms)", 2,

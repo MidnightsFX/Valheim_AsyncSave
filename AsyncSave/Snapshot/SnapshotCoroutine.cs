@@ -58,11 +58,13 @@ namespace AsyncSave.Snapshot
         }
 
         /// Run a whole snapshot inside the calling frame and return with it published, for a save
-        /// that vanilla is about to Join. Only the final-save top-up comes here (see FinalSave): it
-        /// follows an async save that already carried the bulk of the world, so what is left is
-        /// whatever was dirtied while that one ran. Doing that in one block makes the file on disk
-        /// the world as it stood when shutdown began - the guarantee vanilla's own final save
-        /// gives - without vanilla's ZDOExtraData.PrepareSave deep clone of every ZDO.
+        /// that vanilla is about to Join. Only shutdown's save comes here, with the async final
+        /// save option on (see FinalSave): there is no later frame for a coroutine, and doing it
+        /// in one block makes the file on disk the world as it stood when shutdown began - the
+        /// guarantee vanilla's own final save gives - without vanilla's ZDOExtraData.PrepareSave
+        /// deep clone of every ZDO. After a held logout or quit, an async save has already carried
+        /// the bulk of the world and this only has what was dirtied while that one ran; on a
+        /// server stop it is every chunk dirtied since the last autosave.
         ///
         /// The same walk as the async path, unsliced the way the verify harness runs it, and
         /// driven by hand rather than by a coroutine so there is one walk to keep correct. A

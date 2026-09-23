@@ -16,8 +16,7 @@ namespace AsyncSave.Patches
         {
             if (__instance.m_haveStoped) return;
 
-            // The world is going away. Shutdown's save, top-up included, has already run by now;
-            // and the save below must be the vanilla one its comment promises, not a top-up.
+            // The world is going away; nothing is left to hold for.
             FinalSave.Reset();
 
             // Land any character save before the scene goes away.
@@ -26,15 +25,16 @@ namespace AsyncSave.Patches
             if (SnapshotState.InProgress || SnapshotState.ReadyForWrite || ZoneSnapshot.Ready)
             {
                 // Vanilla StopAll joins the save thread unconditionally right after this
-                // (ZNet.cs:392), so whatever we start here has to be the vanilla sync path - an
-                // async save would leave that Join waiting on a writer parked on a coroutine the
-                // main thread can no longer run. ZNet.ShutdownWithoutSave (console suspend) reaches
+                // (ZNet.cs:392), so whatever we start here has to be a sync save - vanilla's, or
+                // ours run to completion when the async final save owns it - since an async save
+                // would leave that Join waiting on a writer parked on a coroutine the main thread
+                // can no longer run. ZNet.ShutdownWithoutSave (console suspend) reaches
                 // StopAll without going through Game.Shutdown, so the latch is not already set.
                 // Game.Awake clears it again if we come back to a world in the same process.
                 ProfileSave.ForceSync = true;
 
                 // SaveWorld(true) will invoke our SaveWorldPatch.Prefix which aborts the
-                // pending snapshot and re-runs vanilla PrepareSave/SaveChunks synchronously.
+                // pending snapshot and redoes the whole save synchronously.
                 __instance.SaveWorld(true);
             }
         }
