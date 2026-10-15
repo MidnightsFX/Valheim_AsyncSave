@@ -9,8 +9,9 @@ namespace AsyncSave.Snapshot
     /// coarsens: wherever a 2x2 block of chunks holds fewer than 100k ZDOs between them and no
     /// finer chunk has already been written to disk for that area, the four collapse into one
     /// bigger chunk. Three coarsening rounds give chunk sizes 0 (8x8 zones) through 3 (64x64).
-    /// Of the resulting chunks, only those in ZDOMan's dirty set are written; everything else
-    /// keeps whatever .chunk file it already has on disk.
+    /// Of the resulting chunks, those in ZDOMan's dirty set are written, and so is any chunk the
+    /// chunk save mapping has no file for yet; everything else keeps the .chunk file it already
+    /// has on disk.
     ///
     /// This is a literal transcription of DecideChunkSize and the chunk-selection half of
     /// AddObjectsPerChunk (DecompiledProject/assembly_valheim/ZDOMan.cs). It has to stay literal:
@@ -92,11 +93,12 @@ namespace AsyncSave.Snapshot
             totalChunkFiles = NonEmpty(count0) + NonEmpty(count1) + NonEmpty(count2) + NonEmpty(count3);
 
             var dirty = zdoMan.m_dirtyChunks[0];
+            var mapping = zdoMan.m_chunkSaveMapping;
             long zdos = 0;
-            zdos += Select(64, 0, count0, dirty, selected);
-            zdos += Select(32, 1, count1, dirty, selected);
-            zdos += Select(16, 2, count2, dirty, selected);
-            zdos += Select(8, 3, count3, dirty, selected);
+            zdos += Select(64, 0, count0, dirty, mapping, selected);
+            zdos += Select(32, 1, count1, dirty, mapping, selected);
+            zdos += Select(16, 2, count2, dirty, mapping, selected);
+            zdos += Select(8, 3, count3, dirty, mapping, selected);
             selectedZdoCount = zdos > int.MaxValue ? int.MaxValue : (int)zdos;
         }
 
@@ -166,10 +168,15 @@ namespace AsyncSave.Snapshot
         }
 
         /// The chunk-selection half of ZDOMan.AddObjectsPerChunk: every non-empty slot that is
-        /// also dirty. Vanilla derives the chunk's x/y from the slot index the same way.
-        /// Returns the ZDO count across the chunks it selected.
+        /// dirty or has no file in the chunk save mapping. Vanilla derives the chunk's x/y from
+        /// the slot index the same way. Returns the ZDO count across the chunks it selected.
+        ///
+        /// The mapping half is in Valheim 1.0.17 and not in 1.0.14. Before it, a populated chunk
+        /// that was not dirty and had never been written was skipped, and its ZDOs reached no
+        /// file at all. A null mapping counts as "nothing on disk", as it does in Coarsen.
         private static long Select(int size, byte chunkSize, int[] counts,
                                    HashSet<ZoneSystem.ChunkIndex> dirty,
+                                   ChunkSaveMapping mapping,
                                    List<ZoneSystem.ChunkIndex> selected)
         {
             int stride = 64 / size;
@@ -181,7 +188,7 @@ namespace AsyncSave.Snapshot
                 uint x = (uint)(i % size * stride);
                 uint y = (uint)(i / size * stride);
                 var index = ZoneSystem.ChunkIndexFromXY(x, y, chunkSize);
-                if (!dirty.Contains(index)) continue;
+                if (!dirty.Contains(index) && mapping != null && mapping.Chunks.ContainsKey(index)) continue;
 
                 selected.Add(index);
                 zdos += counts[i];

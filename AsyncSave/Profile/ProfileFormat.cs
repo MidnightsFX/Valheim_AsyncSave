@@ -16,7 +16,7 @@ namespace AsyncSave.Profile
     /// down and vanilla runs.
     internal static class ProfileFormat
     {
-        public const int ProfileVersion = 46;
+        public const int ProfileVersion = 47;
         public const int PlayerStatCount = 205;
 
         /// Stats are kept per achievement difficulty. Slot 0 is the all-difficulties total;

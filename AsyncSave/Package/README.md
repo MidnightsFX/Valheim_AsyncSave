@@ -38,3 +38,9 @@ config file is never rewritten, so the setting you chose is still there next lau
 
 BepInEx. No dependencies on other mods. Incompatible with SmoothSave (they patch the same paths);
 BepInEx will refuse to load both.
+
+---
+
+If you enjoy my mods donations are appreciated. My mods will never be paid and donations are not required.
+
+<a href="https://ko-fi.com/midnightsfx"><img height="36" src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Support me on Ko-fi"></a>

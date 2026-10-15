@@ -594,7 +594,7 @@ namespace AsyncSave.Snapshot
             int keptCount = SnapshotState.EntryCount - SnapshotState.PendingRemoves.Count;
             if (log == SALogLevel.Simple)
             {
-                Log.Info($"AsyncSave snapshot: {keptCount} ZDOs across {SnapshotState.ChunkCount} dirty " +
+                Log.Info($"AsyncSave snapshot: {keptCount} ZDOs across {SnapshotState.ChunkCount} " +
                          $"chunk(s) of {SnapshotState.TotalChunkFiles} in {totalStopwatch.ElapsedMilliseconds} ms " +
                          $"over {slice.Blocks} frames (worst block: {slice.WorstBlockMs:0.00} ms).");
             }

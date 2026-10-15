@@ -106,7 +106,7 @@ namespace AsyncSave.Profile
         private static byte[] VanillaPackage(PlayerProfile p)
         {
             var pkg = new ZPackage();
-            pkg.Write(46);
+            pkg.Write(47);
             pkg.Write(205);
             pkg.Write(10);
             for (int i = 0; i < 10; ++i)

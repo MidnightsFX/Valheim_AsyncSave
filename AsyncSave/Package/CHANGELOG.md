@@ -1,3 +1,11 @@
+**0.6.1**
+---
+```
+Updated for the latest Valheim patch, so character saves run in the background again.
+World saves now also cover parts of the world that had never been saved before, matching a fix in the game itself.
+```
+
+
 **0.6.0**
 ---
 ```
