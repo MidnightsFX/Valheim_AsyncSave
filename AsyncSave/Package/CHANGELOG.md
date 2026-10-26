@@ -1,3 +1,13 @@
+**0.7.0**
+---
+```
+The save log line now says where the world is stored and how much of a slow save was the game's own world backup, so a slow save on cloud storage is no longer pinned on the mod.
+The first save after a world loads no longer stalls while the mod sets up its working memory, which now happens on the loading screen.
+Logging out or quitting is a little quicker, as the character save made then now copies the map in bulk.
+Background character saves now sync achievement progress and check cloud storage space the same way the game itself does.
+```
+
+
 **0.6.1**
 ---
 ```

@@ -85,6 +85,17 @@ namespace AsyncSave.Snapshot
             FilteredKeys = new string[64];
         }
 
+        /// Size the arrays for a world before its first save, from the live counts. These are the
+        /// grows Capture would otherwise do on the first save's closing block; WorldLoadPatch
+        /// calls this on the loading screen instead.
+        public static void Presize(int zones, int locations, int keys)
+        {
+            Grow(ref Zones, zones);
+            Grow(ref Locations, locations);
+            Grow(ref GlobalKeys, keys);
+            Grow(ref FilteredKeys, keys);
+        }
+
         private static void Grow<T>(ref T[] arr, int need)
         {
             if (arr.Length >= need) return;

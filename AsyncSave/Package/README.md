@@ -24,8 +24,8 @@ gzips the result and writes the `.fch` synchronously. AsyncSave bulk-copies the 
 file write to a background worker. The parts that touch Unity-owned or gameplay-mutated state stay
 on the main thread.
 
-The character save made on quit, logout and shutdown always uses the untouched vanilla path, so the
-last save before the scene goes away is never in flight.
+The character save made on quit, logout and shutdown still runs synchronously and in full before the
+scene goes away, so it is never in flight; only its minimap step uses the bulk copy.
 
 ### Automatic stand-downs
 

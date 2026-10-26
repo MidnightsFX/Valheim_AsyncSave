@@ -185,7 +185,8 @@ namespace AsyncSave.Config
                 "Move the character (.fch) save off the main thread: bulk-copy the minimap instead of " +
                 "writing 8 million bools one at a time, then compress, hash and write on a worker. " +
                 "Runs wherever there is a local player, and also covers a dedicated server's own " +
-                "profile write. Quitting always uses the untouched vanilla path. The mod stands " +
+                "profile write. Quitting and logging out still save synchronously and in full before " +
+                "the scene goes away; only the map step takes the faster path there. The mod stands " +
                 "this down by itself, for the session only, if the .fch layout is not the one this " +
                 "build was written against - this setting is never rewritten on disk.");
 
