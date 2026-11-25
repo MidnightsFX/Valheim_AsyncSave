@@ -62,8 +62,8 @@ namespace AsyncSave.Patches
                 return false;
             }
 
-            // Taken here rather than around the file write so it also covers vanilla's
-            // ConsiderAutoBackup / PreSaveCloudChecksAndOperations prologue, which touches the
+            // Taken for the whole body rather than around the chunk write:
+            // PreSaveCloudChecksAndOperations before it and ConsiderAutoBackup after it touch the
             // same SaveSystem statics the character worker does.
             long t1 = Stopwatch.GetTimestamp();
             Monitor.Enter(SaveIo.Gate);
@@ -162,12 +162,13 @@ namespace AsyncSave.Patches
 
     /// Times vanilla's auto-backup decision for the world so the write line can account for it.
     ///
-    /// ZNet.ConsiderAutoBackup runs inside SaveWorldThread, in the window SaveWorldThreadPatch
-    /// times, and it is not merely a check: it re-enumerates every save file the account holds
-    /// - on cloud storage, one platform query per file - and when a backup is due it copies the
-    /// whole world through the same storage, every chunk file included, not just the chunks this
-    /// save is writing. On a cloud world with 92 chunk files that copy was 6.9 s of a 7.3 s
-    /// "world write" whose actual chunk write took 57 ms. Without this the line blamed our writer.
+    /// ZNet.ConsiderAutoBackup runs at the end of SaveWorldThread, once the write has succeeded,
+    /// still inside the window SaveWorldThreadPatch times, and it is not merely a check: it
+    /// re-enumerates every save file the account holds - on cloud storage, one platform query
+    /// per file - and when a backup is due it copies the whole world through the same storage,
+    /// every chunk file included, not just the chunks this save wrote. On a cloud world with 92
+    /// chunk files that copy was 6.9 s of a 7.3 s "world write" whose actual chunk write took
+    /// 57 ms. Without this the line blamed our writer.
     ///
     /// World saves only. The character save calls the same method - from our worker, under the
     /// same gate - and the per-type filter keeps it out of the world figure. Plain statics are

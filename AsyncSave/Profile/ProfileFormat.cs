@@ -11,9 +11,9 @@ namespace AsyncSave.Profile
     /// SavePlayerToDiskPatch reproduces PlayerProfile.SavePlayerToDisk's serialization by hand.
     /// That is character data, so a silent format change in a game update is the one failure
     /// mode worth engineering against. Vanilla writes the version, the stat count and the
-    /// difficulty-slot count as IL literals, so we read its original instruction stream and
-    /// confirm they are what we expect. On any mismatch the whole character-save half stands
-    /// down and vanilla runs.
+    /// difficulty-slot count as IL literals, and bounds its world-key loop with one, so we read
+    /// its original instruction stream and confirm they are what we expect. On any mismatch the
+    /// whole character-save half stands down and vanilla runs.
     internal static class ProfileFormat
     {
         public const int ProfileVersion = 47;
@@ -29,8 +29,10 @@ namespace AsyncSave.Profile
 
         /// How many GlobalKeys values SavePlayerToDisk folds into m_knownWorldKeys. Not part of
         /// the byte layout - it drives a side effect - but wrong here means the playtime
-        /// counters drift from vanilla's.
-        public const int GlobalKeyCount = 53;
+        /// counters drift from vanilla's. Checked against vanilla's loop bound rather than taken
+        /// from GlobalKeys.Count, which is compiled into this DLL and goes stale without a word
+        /// when an update adds keys.
+        public const int GlobalKeyCount = 56;
 
         public const int MapVersion = 8;
 
@@ -60,11 +62,26 @@ namespace AsyncSave.Profile
                 return false;
             }
 
+            var getGlobalKey = AccessTools.DeclaredMethod(typeof(ZoneSystem), nameof(ZoneSystem.GetGlobalKey),
+                                                          new[] { typeof(GlobalKeys), typeof(string).MakeByRefType() });
+            if (getGlobalKey == null)
+            {
+                Log.Error("AsyncSave: ZoneSystem.GetGlobalKey(GlobalKeys, out string) not found. Async character save disabled.");
+                return false;
+            }
+
+            List<CodeInstruction> profileBody, mapBody;
+            if (!ReadBody(method, "PlayerProfile.SavePlayerToDisk", out profileBody)) return false;
+            if (!ReadBody(mapMethod, "Minimap.GetMapData", out mapBody)) return false;
+
             int[] profileLiterals;
-            if (!FirstWriteIntLiterals(method, writeInt, 3, "PlayerProfile.SavePlayerToDisk", out profileLiterals)) return false;
+            if (!FirstWriteIntLiterals(profileBody, writeInt, 3, "PlayerProfile.SavePlayerToDisk", out profileLiterals)) return false;
 
             int[] mapLiterals;
-            if (!FirstWriteIntLiterals(mapMethod, writeInt, 1, "Minimap.GetMapData", out mapLiterals)) return false;
+            if (!FirstWriteIntLiterals(mapBody, writeInt, 1, "Minimap.GetMapData", out mapLiterals)) return false;
+
+            int keyCount;
+            if (!GlobalKeyLoopBound(profileBody, getGlobalKey, out keyCount)) return false;
 
             int version = profileLiterals[0];
             int statCount = profileLiterals[1];
@@ -87,30 +104,42 @@ namespace AsyncSave.Profile
                 return false;
             }
 
+            if (keyCount != GlobalKeyCount)
+            {
+                Log.Error($"AsyncSave: PlayerProfile.SavePlayerToDisk counts playtime for {keyCount} world keys, " +
+                          $"expected {GlobalKeyCount}. Async character save disabled; vanilla character saving " +
+                          "is untouched.");
+                return false;
+            }
+
             return true;
         }
 
-        /// The first `count` integer literals that `method` passes to ZPackage.Write(int).
-        ///
-        /// Anchored on the call rather than on "the first int literals in the body", because
-        /// the prologue pushes plenty of its own: SaveSystem.PreSaveCloudChecksAndOperations
-        /// alone contributes an enum argument and a literal 1.
-        private static bool FirstWriteIntLiterals(MethodBase method, MethodInfo writeInt, int count,
-                                                  string what, out int[] values)
+        private static bool ReadBody(MethodBase method, string what, out List<CodeInstruction> body)
         {
-            values = null;
-
-            List<CodeInstruction> body;
             try
             {
                 body = new List<CodeInstruction>(PatchProcessor.GetOriginalInstructions(method));
+                return true;
             }
             catch (System.Exception ex)
             {
                 Log.Error($"AsyncSave: could not read {what} IL ({ex.Message}). " +
                           "Async character save disabled.");
+                body = null;
                 return false;
             }
+        }
+
+        /// The first `count` integer literals `body` passes to ZPackage.Write(int).
+        ///
+        /// Anchored on the call rather than on "the first int literals in the body", because
+        /// the prologue pushes plenty of its own: SaveSystem.PreSaveCloudChecksAndOperations
+        /// alone contributes an enum argument and a literal 1.
+        private static bool FirstWriteIntLiterals(List<CodeInstruction> body, MethodInfo writeInt, int count,
+                                                  string what, out int[] values)
+        {
+            values = null;
 
             var found = new int[count];
             int n = 0;
@@ -131,6 +160,24 @@ namespace AsyncSave.Profile
 
             values = found;
             return true;
+        }
+
+        /// The literal the world-key loop compares its index with. A for loop compiles its test
+        /// to the bottom of the body, so it is the first `ldc.i4 N; blt` after the loop's
+        /// GetGlobalKey call.
+        private static bool GlobalKeyLoopBound(List<CodeInstruction> body, MethodInfo getGlobalKey, out int bound)
+        {
+            bound = 0;
+            int call = body.FindIndex(ins => ins.Calls(getGlobalKey));
+            for (int i = call + 1; call >= 0 && i + 1 < body.Count; ++i)
+            {
+                var next = body[i + 1].opcode;
+                if ((next == OpCodes.Blt || next == OpCodes.Blt_S) && TryGetInt32(body[i], out bound)) return true;
+            }
+
+            Log.Error("AsyncSave: could not find the world-key loop in PlayerProfile.SavePlayerToDisk. " +
+                      "Async character save disabled.");
+            return false;
         }
 
         private static bool TryGetInt32(CodeInstruction ins, out int value)

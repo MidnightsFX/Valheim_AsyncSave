@@ -150,7 +150,7 @@ namespace AsyncSave.Profile
                 int difficulty = Achievements.GetCurrentAchievementDifficultyIndex();
                 p.m_playerStats[0].m_knownWorlds.IncrementOrSet(ZNet.instance.GetWorldName(), totalSeconds);
                 p.m_playerStats[difficulty].m_knownWorlds.IncrementOrSet(ZNet.instance.GetWorldName(), totalSeconds);
-                for (int key = 0; key < 53; ++key)
+                for (int key = 0; key < 56; ++key)
                 {
                     string value;
                     if (ZoneSystem.instance.GetGlobalKey((GlobalKeys)key, out value))

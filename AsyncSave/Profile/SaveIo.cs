@@ -17,6 +17,14 @@ namespace AsyncSave.Profile
     /// already - including Steam cloud writes - so background IO is sanctioned, but they only
     /// ever run one save thread at a time (ZNet.SaveWorld joins the previous one before
     /// starting the next). We join that invariant rather than running beside it.
+    ///
+    /// The main menu's cache work is outside the lock and needs no part of it. FejdStartup.Start
+    /// invalidates and rebuilds the save lists, and since 1.0.21 OnWorldStart rescans local
+    /// worlds (SaveCollection.ReloadLocal), clearing and refilling every SaveWithBackups in place.
+    /// Both run on the main thread in the start scene, and no background save reaches it:
+    /// Game.Shutdown drains this worker (short of a job that outlives Drain's timeout),
+    /// ZNet.StopAll joins the world save thread before the scene changes, and nothing is queued
+    /// here again until the next Game.Awake.
     internal static class SaveIo
     {
         /// Held for the duration of any job that touches SaveSystem / FileHelpers / FileWriter.

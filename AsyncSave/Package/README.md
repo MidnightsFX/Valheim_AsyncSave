@@ -1,8 +1,9 @@
 # AsyncSave
 
 AsyncSave moves Valheim's world and character saves off the main thread, so a save no longer
-freezes the game. Nothing about the save *format* changes — the bytes it writes are the bytes
-vanilla would have written.
+freezes the game. Nothing about the save *format* changes: on the game version it was built for,
+the bytes it writes are the bytes vanilla would have written. A game update can change those bytes,
+so update AsyncSave along with the game.
 
 The two halves are independent and neither syncs anything over the network, so the same DLL runs
 unmodified on a dedicated server, a client, or a host, any mix is supported.
@@ -27,17 +28,31 @@ on the main thread.
 The character save made on quit, logout and shutdown still runs synchronously and in full before the
 scene goes away, so it is never in flight; only its minimap step uses the bulk copy.
 
+### Steam Cloud writes (anywhere a save goes to Steam Cloud)
+
+The game's Steam Cloud writer allocates a 100 MB buffer for every file it writes, whatever the file's
+size, so one save of a cloud world or character allocates gigabytes. Allocating that much from a
+background writer also stalls the main thread, which waits on the garbage collector. AsyncSave sizes
+that buffer to the file instead; Steam receives the same bytes in the same calls. This applies to every
+cloud write, with or without the two settings above.
+
 ### Automatic stand-downs
 
 If the mod cannot safely run — it fails to patch `ZNet.SaveWorld`, the `.fch` layout is not the one
 this build was written against, the revision hooks are missing, or the host is big-endian — it
 disables the affected half or falls back to `FullScan` **for that session only** and logs why. Your
-config file is never rewritten, so the setting you chose is still there next launch.
+config file is never rewritten, so the setting you chose is still there next launch. If the game's
+Steam Cloud writer no longer looks the way this build expects, it is left as the game wrote it.
 
 ## Requirements
 
 BepInEx. No dependencies on other mods. Incompatible with SmoothSave (they patch the same paths);
 BepInEx will refuse to load both.
+
+<!--
+AI_Assisted_Creation: This assembly was partially or fully created with the assistance of generative AI (Claude Code, using Anthropic's Claude models).
+AI_Model_Vendor: Anthropic
+-->
 
 ---
 

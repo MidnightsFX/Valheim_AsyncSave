@@ -14,7 +14,7 @@ namespace AsyncSave
     {
         public const string PluginGUID = "MidnightsFX.AsyncSave";
         public const string PluginName = "AsyncSave";
-        public const string PluginVersion = "0.7.0";
+        public const string PluginVersion = "0.8.0";
 
         private Harmony _harmony;
 

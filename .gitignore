@@ -1,8 +1,11 @@
 .vs/*
 AsyncSave/bin/*
 AsyncSave/obj/*
+Tools/*/bin/
+Tools/*/obj/
 .kilo/*
 
 # built dll dropped into the thunderstore package by the Release build
 AsyncSave/Package/plugins/*
 .env
+Tools/*

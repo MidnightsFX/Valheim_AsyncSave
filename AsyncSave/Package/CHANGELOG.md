@@ -1,3 +1,12 @@
+**0.8.0**
+---
+```
+Updated for Valheim 1.0.30
+Character saves update the same world statistics the game now does.
+Saves to Steam Cloud are faster and cause much smaller hitches, as the game no longer sets aside a huge block of memory for every file it writes.
+```
+
+
 **0.7.0**
 ---
 ```

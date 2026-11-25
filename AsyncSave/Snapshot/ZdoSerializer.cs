@@ -28,10 +28,11 @@ namespace AsyncSave.Snapshot
     ///  - The sector field is gone. It used to sit between the flags and the position; ZDOMan
     ///    now recomputes it from the position on load.
     ///  - Position is packed to a Vector2s when it round-trips exactly and y is zero, which is
-    ///    the common case for anything sitting on the ground. Rotation is packed by
-    ///    ZPackage.WriteSmallRotation. Both decisions come from the game's own helpers
-    ///    (Utils.SmallPosition / Utils.CloseToZero) rather than being reimplemented - they are
-    ///    bit-exact float predicates and reimplementing them is how you lose a world.
+    ///    the common case for anything sitting on the ground. Rotation is packed the way
+    ///    ZPackage.WriteSmallRotation packs it. The packing and quantizing decisions come from the
+    ///    game's own helpers (Utils.SmallPosition, Utils.CloseToZero, Utils.QuantizeHalfDegrees)
+    ///    rather than being reimplemented - they are bit-exact float predicates and
+    ///    reimplementing them is how you lose a world.
     ///  - Extra data is filtered against ZDOExtraData.s_sessionOnly. Vanilla does this in
     ///    GetSaveData, after PrepareSave has cloned; we do it inline, which means the section
     ///    flag has to be decided on the *filtered* count, not the raw one.
@@ -330,22 +331,22 @@ namespace AsyncSave.Snapshot
             return kept;
         }
 
-        /// ZPackage.WriteSmallRotation. Two forms: a single short when both pitch and roll are
-        /// within half a degree of 0 or 360 (the flat case, which is most placed pieces), and
-        /// otherwise three 10-bit fields packed into a uint and written as two ushorts, high
-        /// half first. That high-half-first order is not a byte-order accident - vanilla writes
-        /// two separate little-endian ushorts - so it has to be reproduced exactly.
+        /// ZPackage.WriteSmallRotation. Each angle is quantized to half degrees by the game's own
+        /// Utils.QuantizeHalfDegrees, the same helper Utils.CloseToZero uses. Two forms: a single
+        /// short holding the yaw when pitch and roll both quantize to 0 (the flat case, which is
+        /// most placed pieces), and otherwise three 10-bit fields packed into a uint and written
+        /// as two ushorts, high half first. That high-half-first order is not a byte-order
+        /// accident - vanilla writes two separate little-endian ushorts - so it has to be
+        /// reproduced exactly.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static byte* WriteSmallRotation(byte* p, Vector3 v3)
         {
-            v3 *= 2f;
-            uint x = (uint)v3.x;
-            uint y = (uint)v3.y;
-            uint z = (uint)v3.z;
-            if ((x <= 1 || x >= 719) && (z <= 1 || z >= 719))
+            uint x = Utils.QuantizeHalfDegrees(v3.x);
+            uint y = Utils.QuantizeHalfDegrees(v3.y);
+            uint z = Utils.QuantizeHalfDegrees(v3.z);
+            if (x == 0 && z == 0)
             {
-                y |= 0x8000;
-                *(ushort*)p = (ushort)y;
+                *(ushort*)p = (ushort)(y | 0x8000);
                 return p + 2;
             }
             uint packed = x | (y << 10) | (z << 20);
